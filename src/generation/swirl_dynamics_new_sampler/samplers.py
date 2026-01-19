@@ -14,9 +14,7 @@ ArrayMapping: TypeAlias = Mapping[str, Array]
 Params: TypeAlias = Mapping[str, Any]
 
 parser = argparse.ArgumentParser()
-parser.add_argument(
-    "--config", type=str, default="src/generation/settings_generation.yaml"
-)
+parser.add_argument("--config", type=str, default="src/generation/settings_GEN.yaml")
 args = parser.parse_args()
 with open(args.config, "r") as f:
     run_sett = yaml.safe_load(f)
@@ -39,7 +37,7 @@ class NewDriftSdeSampler(dfn_lib.SdeSampler):
     diffusion term from the parent SdeSampler class.
     """
 
-    guidance_fn: Callable[[Array, Array], Array] | None = flax.struct.field(
+    guidance_fn: Callable[[Array, Array, Array], Array] | None = flax.struct.field(
         default=None, pytree_node=False
     )
     T: float = float(run_sett["general"]["T"])
@@ -54,7 +52,7 @@ class NewDriftSdeSampler(dfn_lib.SdeSampler):
 
         In score function:
 
-        dx = [ṡ(t)/s(t) x - 2 s(t)²σ̇(t)σ(t) ∇pₜ(x)- 2 s(t)²σ̇(t)σ(t) ∇h_T-t(x)] dt + s(t) √[2σ̇(t)σ(t)] dωₜ,
+        dx = [ṡ(t)/s(t) x - 2 s(t)²σ̇(t)σ(t) ∇pₜ(x)- 2 s(t)²σ̇(t)σ(t) ∇h_T-t(x, y)] dt + s(t) √[2σ̇(t)σ(t)] dωₜ,
 
         obtained by substituting eq. 28, 34 of Karras et al.
         (https://arxiv.org/abs/2206.00364) into the reverse SDE formula - eq. 6 in
@@ -84,7 +82,18 @@ class NewDriftSdeSampler(dfn_lib.SdeSampler):
             drift -= 2 * dlog_sigma_dt * s * denoise_fn(x_hat, sigma, params["cond"])
 
             if self.guidance_fn is not None:
-                grad_guidance = self.guidance_fn(x, self.T - t)
+                guidance_inputs = params["guidance_inputs"]
+                if "y" not in guidance_inputs:
+                    raise ValueError(
+                        "Missing `y` in guidance_inputs; pass guidance_inputs={'y': <batch_y>} to `generate`."
+                    )
+                y = guidance_inputs["y"]
+                # Flatten potential trailing singleton channel dims
+                x_for_guidance = x.squeeze(-1) if x.ndim == 3 else x
+                y_for_guidance = y.squeeze(-1) if y.ndim == 3 else y
+                grad_guidance = self.guidance_fn(
+                    x_for_guidance, y_for_guidance, self.T - t
+                )
                 dsquare_sigma_dt = dsquare_dt(self.scheme.sigma)(t)
                 drift -= s**2 * dsquare_sigma_dt * grad_guidance[..., None]
             else:

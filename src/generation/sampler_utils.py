@@ -16,9 +16,7 @@ import argparse
 import yaml
 
 parser = argparse.ArgumentParser()
-parser.add_argument(
-    "--config", type=str, default="src/generation/settings_generation.yaml"
-)
+parser.add_argument("--config", type=str, default="src/generation/settings_GEN.yaml")
 args = parser.parse_args()
 with open(args.config, "r") as f:
     run_sett = yaml.safe_load(f)
@@ -184,6 +182,7 @@ def sample_pde_guided(
     pde_solver,
     rng_key: jax.Array,
     samples_per_condition: int,
+    y: jnp.ndarray,
 ):
     """Generate samples guided by our additional gradient term.
 
@@ -198,10 +197,17 @@ def sample_pde_guided(
         rng_key: JAX PRNG key for sampling.
         samples_per_condition: Number of batches; each batch generates
             `pde_solver.num_models` samples.
+        y: Target low-resolution conditions; shape `(M, d')` or `(M, d', 1)`
+           where `M == pde_solver.num_models`.
 
     Returns:
-        Array with shape `(samples_per_condition, num_models, d, 1)`.
+        Array with shape `(samples_per_condition, M, d, 1)`.
     """
+    num_models = int(pde_solver.num_models)
+    if y.shape[0] != num_models:
+        raise ValueError(
+            f"`y` must have leading size {num_models}, but got {y.shape[0]}"
+        )
     sampler = NewDriftSdeSampler(
         input_shape=(run_sett["general"]["d"], 1),
         integrator=solver_lib.EulerMaruyama(),
@@ -218,17 +224,18 @@ def sample_pde_guided(
         return_full_paths=False,
     )
 
-    # no vmap but lax.scan (jit compatible for loop) to save memory
+    # Generate `samples_per_condition` independent batches; reuse the same `y` batch each time.
     keys = jax.random.split(rng_key, samples_per_condition)
-    generate_one_batch = jax.jit(
-        lambda k: sampler.generate(rng=k, num_samples=pde_solver.num_models)
+    generate_one = jax.jit(
+        lambda k: sampler.generate(
+            rng=k, num_samples=num_models, guidance_inputs={"y": y}
+        )
     )
 
-    # scan requires a carry argument, simply input None
+    # scan requires a carry argument; use None
     def loop_body(carry, key):
-        samples = generate_one_batch(key)
+        samples = generate_one(key)
         return carry, samples
 
-    _, all_samples = jax.lax.scan(loop_body, init=None, xs=keys)
-
-    return all_samples
+    _, samples_all = jax.lax.scan(loop_body, init=None, xs=keys)
+    return samples_all

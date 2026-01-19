@@ -9,9 +9,7 @@ import argparse
 import yaml
 
 parser = argparse.ArgumentParser()
-parser.add_argument(
-    "--config", type=str, default="src/generation/settings_generation.yaml"
-)
+parser.add_argument("--config", type=str, default="src/generation/settings_GEN.yaml")
 args = parser.parse_args()
 with open(args.config, "r") as f:
     run_sett = yaml.safe_load(f)

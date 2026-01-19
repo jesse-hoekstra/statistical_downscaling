@@ -92,23 +92,23 @@ class DGMNetJax(nn.Module):
     projection to produce a scalar PDE solution estimate.
     """
 
-    input_dim: int  # spatial input dimension d
+    input_dim: int  # spatial input dimension d + d_prime
     layer_width: int
     num_layers: int
     final_trans: Optional[str] = None
 
     @nn.compact
-    def __call__(self, t: jax.Array, x: jax.Array) -> jax.Array:
+    def __call__(self, t: jax.Array, x: jax.Array, y: jax.Array) -> jax.Array:
         """Forward pass of a Deep Galerkin Network (DGM) in JAX/Flax.
 
         Args:
             t: Time inputs `(B, 1)`.
-            x: Spatial inputs `(B, d)`.
-
+            x: Spatial inputs `(B, d + d_prime)`.
+            y: Target inputs `(B, d_prime)`.
         Returns:
             Scalar output `(B, 1)` implementing an approximation to the PDE solution.
         """
-        X = jnp.concatenate([t, x], axis=1)
+        X = jnp.concatenate([t, x, y], axis=1)
         S = DenseLayerJax(self.input_dim + 1, self.layer_width, transformation="tanh")(
             X
         )

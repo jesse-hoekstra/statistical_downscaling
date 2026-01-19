@@ -1,9 +1,6 @@
-"""Entry point for KS statistical downscaling: train or sample the model."""
-
 import os
 import sys
 import jax
-
 import jax.numpy as jnp
 import numpy as np
 import h5py
@@ -24,7 +21,6 @@ from src.generation.denoiser_utils import (
     build_trainer,
     run_training,
 )
-
 from src.generation.utils_metrics import (
     calculate_constraint_rmse,
     calculate_sample_variability,
@@ -41,21 +37,68 @@ from src.generation.sampler_utils import (
 )
 
 parser = argparse.ArgumentParser()
-parser.add_argument(
-    "--config", type=str, default="src/generation/settings_generation.yaml"
-)
+parser.add_argument("--config", type=str, default="src/generation/settings_GEN.yaml")
 args = parser.parse_args()
 with open(args.config, "r") as f:
     run_sett = yaml.safe_load(f)
 
-USE_WANDB = False
-TRAIN_DENOISER = False
-TRAIN_PDE = False
-CONTINUE_TRAINING = False
-mode = "eval"
+use_wandb_cfg = bool(run_sett["wandb"]["use_wandb"])
+env_disable = os.environ.get("WANDB_DISABLED", "").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+use_wandb = use_wandb_cfg and (not env_disable)
+
+project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+
+env_run_name = os.environ.get("WANDB_NAME", "").strip()
+if not env_run_name:
+    env_run_name = f"run_seed{run_sett['global']['seed']}"
+
+gpu_tag_env = os.environ.get("GPU_TAG", "").strip()
+if not gpu_tag_env:
+    cuda_env = os.environ.get("CUDA_VISIBLE_DEVICES", "").strip()
+    if cuda_env:
+        gpu_tag_env = f"cuda{cuda_env}"
+if gpu_tag_env:
+    env_run_name = f"{env_run_name}_{gpu_tag_env}"
+
+root_work_dir = os.path.join(project_root, "main_GEN")
+work_dir = os.path.join(root_work_dir, env_run_name)
+os.makedirs(work_dir, exist_ok=True)
+run_sett["global"]["work_dir"] = work_dir
+
+writer = None
+key_suffix = ""
+
+if use_wandb:
+    base_writer = metric_writers.create_default_writer(work_dir, asynchronous=False)
+
+    project = os.environ.get("WANDB_PROJECT", "generation")
+    entity = os.environ.get("WANDB_ENTITY")  # optional
+    run_name = os.environ.get("WANDB_NAME", env_run_name)
+    if gpu_tag_env and gpu_tag_env not in run_name:
+        run_name = f"{run_name}_{gpu_tag_env}"
+    key_suffix = f"_{gpu_tag_env}" if gpu_tag_env else ""
+    mode = str(run_sett["global"]["mode"])
+
+    writer = WandbWriter(
+        base_writer,
+        project=project,
+        name=f"{run_name}_{mode}",
+        entity=entity,
+        config={"work_dir": work_dir, **run_sett},
+        active=True,
+    )
+else:
+    print(
+        "[INFO] use_wandb=False -> disable ALL logging/plotting to avoid local memory pressure."
+    )
 
 
-def save_samples_h5(path, samples, *, y_bar=None, run_settings=None, rng_key=None):
+def _save_samples_h5(path, samples, *, y_bar=None, run_settings=None, rng_key=None):
     """Save only the samples to an HDF5 file as dataset 'samples'."""
     arr = np.asarray(
         samples, dtype=np.float64
@@ -65,23 +108,27 @@ def save_samples_h5(path, samples, *, y_bar=None, run_settings=None, rng_key=Non
         f.create_dataset("samples", data=arr)
 
 
-def load_samples_h5(path, *, as_jax=True):
+def _load_samples_h5(path, *, as_jax=True):
     """Load samples from an HDF5 file and return a JAX array by default."""
     with h5py.File(path, "r") as f:
         samples_np = f["samples"][()]
+
     return jnp.asarray(samples_np) if as_jax else samples_np
 
 
 def main():
-    """Run training or sampling depending on `mode`."""
-    project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
-    work_dir = os.path.join(project_root, "temporary", "main_generation_KS")
-    os.makedirs(work_dir, exist_ok=True)
+    if mode == "train":
+        print("✓ Running in training mode.")
+    elif mode == "sample":
+        print("✓ Running in sampling mode.")
+    elif mode == "eval":
+        print("✓ Running in evaluation mode.")
+    else:
+        raise ValueError(f"Invalid mode: {mode}")
 
     u_HFHR, u_LFLR, u_HFLR, x, t = get_raw_datasets(
         file_name=run_sett["general"]["data_file_name"]
     )
-
     u_LFLR = u_LFLR[
         :, :, ::2
     ]  # they do this but don't explicitly mention it, note now we need a d_prime of 24
@@ -93,44 +140,23 @@ def main():
     denoiser_model = create_denoiser_model()
     diffusion_scheme = create_diffusion_scheme(DATA_STD)
 
-    # Use env or defaults for project/entity; allow user override
-    project_name = "statistical-downscaling-main-" + mode
-    os.environ.setdefault("WANDB_PROJECT", project_name)
-    os.environ.setdefault("WANDB_ENTITY", "jesse-hoekstra-university-of-oxford")
-    use_wandb = bool(USE_WANDB)
-    base_writer = metric_writers.create_default_writer(work_dir, asynchronous=False)
-    writer = base_writer
-    if use_wandb:
-        project = os.environ.get("WANDB_PROJECT", project_name)
-        run_name = os.environ.get("WANDB_NAME", os.path.basename(work_dir))
-        entity = os.environ.get("WANDB_ENTITY")  # optional
-        if mode == "train":
-            writer_name = run_name
-        elif mode == "sample":
-            writer_name = f"{run_name}-sample"
-        else:
-            writer_name = f"{run_name}-eval"
-        writer = WandbWriter(
-            base_writer,
-            project=project,
-            name=writer_name,
-            entity=entity,
-            config={"work_dir": work_dir, "mode": mode, **run_sett},
-            active=True,
-        )
-
-    def log_fn(payload: dict):
-        step = int(payload.get("step", 0)) if isinstance(payload, dict) else 0
-        metrics = (
-            {k: v for k, v in payload.items() if k != "step"}
-            if isinstance(payload, dict)
-            else payload
-        )
-        writer.write_scalars(step=step, scalars=metrics)
+    num_conditionings = int(run_sett["pde_solver"]["num_conditionings"])
+    log_train_every = int(run_sett["metrics"]["log_train_every"])
+    seed = int(run_sett["global"]["seed"])
 
     if mode == "train":
-        print("Running in training mode…")
-        if TRAIN_DENOISER:
+        lambda_value = float(run_sett["pde_solver"]["lambda"])
+        if run_sett["global"]["train_denoiser"]:
+            batch_size = int(run_sett["general"]["batch_size"])
+            total_train_steps = int(run_sett["general"]["total_train_steps"])
+            metric_aggregation_steps = int(
+                run_sett["general"]["metric_aggregation_steps"]
+            )
+            eval_every_steps = int(run_sett["general"]["eval_every_steps"])
+            num_batches_per_eval = int(run_sett["general"]["num_batches_per_eval"])
+            save_interval_steps = int(run_sett["general"]["save_interval_steps"])
+            max_to_keep = int(run_sett["general"]["max_to_keep"])
+
             model = build_model(denoiser_model, diffusion_scheme, DATA_STD)
             trainer = build_trainer(model)
 
@@ -138,127 +164,117 @@ def main():
                 train_dataloader=get_ks_dataset(
                     u_hfhr_samples,
                     split="train[:75%]",
-                    batch_size=run_sett["general"]["batch_size"],
-                    seed=int(run_sett["rng_key"]),
+                    batch_size=batch_size,
+                    seed=seed,
                 ),
                 trainer=trainer,
                 workdir=work_dir,
-                total_train_steps=run_sett["general"]["total_train_steps"],
+                total_train_steps=total_train_steps,
                 metric_writer=writer,
-                metric_aggregation_steps=run_sett["general"][
-                    "metric_aggregation_steps"
-                ],
+                metric_aggregation_steps=metric_aggregation_steps,
                 eval_dataloader=get_ks_dataset(
                     u_hfhr_samples,
                     split="train[75%:]",
-                    batch_size=run_sett["general"]["batch_size"],
-                    seed=int(run_sett["rng_key"]),
+                    batch_size=batch_size,
+                    seed=seed,
                 ),
-                eval_every_steps=run_sett["general"]["eval_every_steps"],
-                num_batches_per_eval=run_sett["general"]["num_batches_per_eval"],
-                save_interval_steps=run_sett["general"]["save_interval_steps"],
-                max_to_keep=run_sett["general"]["max_to_keep"],
+                eval_every_steps=eval_every_steps,
+                num_batches_per_eval=num_batches_per_eval,
+                save_interval_steps=save_interval_steps,
+                max_to_keep=max_to_keep,
             )
-        if TRAIN_PDE:
-            denoise_fn = restore_denoise_fn(f"{work_dir}/checkpoints", denoiser_model)
+        if run_sett["global"]["train_pde"]:
+            denoise_fn = restore_denoise_fn(
+                f"{work_dir}/checkpoints_denoise_model", denoiser_model
+            )
             pde_solver = KSStatisticalDownscalingPDESolver(
                 samples=u_hfhr_samples,
-                y_bar=u_lflr_samples[0 : int(run_sett["pde_solver"]["num_models"])],
                 settings=run_sett,
                 denoise_fn=denoise_fn,
                 scheme=diffusion_scheme,
-                rng_key=jax.random.PRNGKey(int(run_sett["rng_key"])),
+                rng_key=jax.random.PRNGKey(seed),
             )
-
-            lambda_value = jnp.float32(run_sett["pde_solver"]["lambda"])
-
-            pde_solver.train(
-                log_fn=(lambda payload: log_fn({**payload, "lambda": lambda_value}))
-            )
-            pde_params_dir = os.path.join(work_dir, "pde_params")
-            pde_solver.save_params(pde_params_dir)
-        if CONTINUE_TRAINING:
-            denoise_fn = restore_denoise_fn(f"{work_dir}/checkpoints", denoiser_model)
-            pde_solver = KSStatisticalDownscalingPDESolver(
-                samples=u_hfhr_samples,
-                y_bar=u_lflr_samples[0 : int(run_sett["pde_solver"]["num_models"])],
-                settings=run_sett,
-                denoise_fn=denoise_fn,
-                scheme=diffusion_scheme,
-                rng_key=jax.random.PRNGKey(run_sett["rng_key"]),
-            )
-            pde_params_dir = os.path.join(work_dir, "pde_params_continued")
-            pde_solver.load_params(pde_params_dir)
-            lambda_value = jnp.float32(run_sett["pde_solver"]["lambda"])
-            pde_solver.train(
-                log_fn=(lambda payload: log_fn({**payload, "lambda": lambda_value}))
-            )
-            pde_params_dir = os.path.join(work_dir, "pde_params_continued2")
+            key_master = jax.random.PRNGKey(seed)
+            RNG_NAMESPACE = run_sett["global"]["RNG_NAMESPACE"]
+            for it in range(pde_solver.sampling_stages):
+                key_step = jax.random.fold_in(key_master, RNG_NAMESPACE + it)
+                train_metrics = pde_solver.update_params(key_step)
+                global_step = int(pde_solver._step)
+                if use_wandb:
+                    scalars = {}
+                    if (global_step % log_train_every) == 0:
+                        scalars.update(
+                            {f"train/{k}": float(v) for k, v in train_metrics.items()}
+                        )
+                    writer.write_scalars(step=global_step, scalars=scalars)
+            pde_params_dir = os.path.join(work_dir, "checkpoints_pde_solver")
             pde_solver.save_params(pde_params_dir)
     elif mode == "sample":
+        y = u_lflr_samples[:num_conditionings]
+        generation_type = str(run_sett["global"]["generation_type"])
+        num_gen_samples = int(run_sett["pde_solver"]["num_gen_samples"])
+
         jax.config.update(
             "jax_enable_x64", True
         )  # while the generation of the data was performed in double precision (fp64)
-        print("Running in sampling-only mode…")
-
-        denoise_fn = restore_denoise_fn(f"{work_dir}/checkpoints", denoiser_model)
-        sample_file = os.path.join(work_dir, f"samples_{run_sett['option']}.h5")
-        if run_sett["option"] == "unconditional":
+        denoise_fn = restore_denoise_fn(
+            f"{work_dir}/checkpoints_denoise_model", denoiser_model
+        )
+        sample_file = os.path.join(work_dir, f"samples_{generation_type}.h5")
+        if generation_type == "unconditional":
             samples = sample_unconditional(
                 diffusion_scheme,
                 denoise_fn,
-                jax.random.PRNGKey(run_sett["rng_key"]),
-                num_samples=int(run_sett["pde_solver"]["num_gen_samples"]),
+                jax.random.PRNGKey(seed),
+                num_samples=num_gen_samples,
             )
             print(jnp.mean(samples))
             print(samples.std())
-            save_samples_h5(sample_file, samples)
-        elif run_sett["option"] == "wan_conditional":
-            num_models = int(run_sett["pde_solver"]["num_models"])  # C
-            samples_per_condition = int(run_sett["pde_solver"]["num_gen_samples"])  # N
-            y_bars = u_lflr_samples[:num_models]
+            _save_samples_h5(sample_file, samples)
+        elif generation_type == "wan_conditional":
 
-            if int(run_sett["pde_solver"]["num_models"]) % 16 != 0:
+            if num_conditionings % 16 != 0:
                 samples = sample_wan_guided(
                     diffusion_scheme,
                     denoise_fn,
-                    y_bar=y_bars,
-                    rng_key=jax.random.PRNGKey(run_sett["rng_key"]),
-                    num_samples=samples_per_condition,
+                    y_bar=y,
+                    rng_key=jax.random.PRNGKey(seed),
+                    num_samples=num_gen_samples,
                 )
             else:
                 samples = less_memory_sample_wan_guided(
                     diffusion_scheme,
                     denoise_fn,
-                    y_bar=y_bars,
-                    rng_key=jax.random.PRNGKey(run_sett["rng_key"]),
-                    num_samples=samples_per_condition,
+                    y_bar=y,
+                    rng_key=jax.random.PRNGKey(seed),
+                    num_samples=num_gen_samples,
                 )
             print(samples.std())
             print(samples.shape)
-            save_samples_h5(sample_file, samples)
-        elif run_sett["option"] == "conditional":
+            _save_samples_h5(sample_file, samples)
+        elif generation_type == "conditional":
             pde_solver = KSStatisticalDownscalingPDESolver(
                 samples=u_hfhr_samples,
-                y_bar=u_lflr_samples[0 : int(run_sett["pde_solver"]["num_models"])],
                 settings=run_sett,
                 denoise_fn=denoise_fn,
                 scheme=diffusion_scheme,
-                rng_key=jax.random.PRNGKey(run_sett["rng_key"]),
+                rng_key=jax.random.PRNGKey(seed),
             )
-            pde_params_dir = os.path.join(work_dir, "pde_params_continued2")
+            pde_params_dir = os.path.join(work_dir, "checkpoints_pde_solver")
             pde_solver.load_params(pde_params_dir)
             samples = sample_pde_guided(
                 diffusion_scheme,
                 denoise_fn,
                 pde_solver,
-                rng_key=jax.random.PRNGKey(run_sett["rng_key"]),
-                samples_per_condition=int(run_sett["pde_solver"]["num_gen_samples"]),
+                y=y,
+                rng_key=jax.random.PRNGKey(seed),
+                samples_per_condition=num_gen_samples,
             )
             print(samples.std())
             print(samples.shape)
-            save_samples_h5(sample_file, samples)
+            _save_samples_h5(sample_file, samples)
     elif mode == "eval":
+
         jax.config.update("jax_enable_x64", True)
         downsampling_factor = int(run_sett["general"]["d"]) // int(
             run_sett["general"]["d_prime"]
@@ -272,13 +288,13 @@ def main():
                 for i in range(int(run_sett["general"]["d_prime"]))
             ]
         )
-        print("Running in evaluation mode…")
+
         sample_file = os.path.join(work_dir, f"samples_{run_sett['option']}.h5")
-        samples = load_samples_h5(sample_file, as_jax=True)
+        samples = _load_samples_h5(sample_file, as_jax=True)
 
         constraint_rmse = calculate_constraint_rmse(
             samples,
-            u_lflr_samples[0 : int(run_sett["pde_solver"]["num_models"])],
+            u_lflr_samples[0 : int(run_sett["pde_solver"]["num_conditionings"])],
             C_prime,
         )
         kld = calculate_kld_pooled(
