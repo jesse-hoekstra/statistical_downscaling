@@ -92,10 +92,44 @@ class DGMNetJax(nn.Module):
     projection to produce a scalar PDE solution estimate.
     """
 
-    input_dim: int  # spatial input dimension d + d_prime
+    input_dim: int  # spatial input dimension d + d_prime + time_emb_dim
+    time_emb_dim: int
     layer_width: int
     num_layers: int
+    C_prime: jax.Array
     final_trans: Optional[str] = None
+
+    def _sinusoidal_time_embedding(self, n: jnp.ndarray, dim: int) -> jnp.ndarray:
+        """Return sinusoidal time embedding for step index `n`.
+
+        This mirrors positional encodings: for frequencies geometrically spaced
+        between [1, 1/10000] we apply sin/cos and concatenate.
+
+        Parameters
+        ----------
+        n : jnp.ndarray
+            Scalar or array of time indices.
+        dim : int
+            Embedding dimension.
+
+        Returns
+        -------
+        jnp.ndarray
+            Embedding with shape `n.shape + (dim,)`.
+        """
+        dim = int(dim)
+        half = dim // 2
+        n = n.astype(jnp.float32)
+        freqs = jnp.exp(
+            -jnp.log(10000.0)
+            * jnp.arange(0, half, dtype=jnp.float32)
+            / jnp.maximum(half, 1)
+        )
+        args = n[..., None] * freqs[None, ...]
+        emb = jnp.concatenate([jnp.sin(args), jnp.cos(args)], axis=-1)
+        if dim % 2 == 1:
+            emb = jnp.pad(emb, [(0, 0)] * (emb.ndim - 1) + [(0, 1)])
+        return emb
 
     @nn.compact
     def __call__(self, t: jax.Array, x: jax.Array, y: jax.Array) -> jax.Array:
@@ -108,11 +142,23 @@ class DGMNetJax(nn.Module):
         Returns:
             Scalar output `(B, 1)` implementing an approximation to the PDE solution.
         """
-        X = jnp.concatenate([t, x, y], axis=1)
-        S = DenseLayerJax(self.input_dim + 1, self.layer_width, transformation="tanh")(
-            X
+        te = self._sinusoidal_time_embedding(t, self.time_emb_dim).reshape(
+            t.shape[0], -1
         )
+        y_feat = jnp.concatenate([te, y], axis=1)  # no residuals
+        S_y = DenseLayerJax(y_feat.shape[1], self.layer_width, transformation="tanh")(
+            y_feat
+        )
+        y_gate = jax.nn.sigmoid(S_y)
+
+        x_feat = jnp.concatenate([te, x], axis=1)
+        S_x = DenseLayerJax(x_feat.shape[1], self.layer_width, transformation="tanh")(
+            x_feat
+        )
+        X = y_gate * S_x + (1 - y_gate) * S_y
+
+        S = DenseLayerJax(self.layer_width, self.layer_width, transformation="tanh")(X)
         for _ in range(self.num_layers):
-            S = LSTMLayerJax(self.input_dim + 1, self.layer_width)(S, X)
+            S = LSTMLayerJax(self.layer_width, self.layer_width)(S, X)
         out = DenseLayerJax(self.layer_width, 1, transformation=self.final_trans)(S)
         return out

@@ -2,17 +2,19 @@ global:
   seed: 888
   RNG_NAMESPACE: 20260115
   generation_type: 'conditional'
-  mode: 'sample'
+  mode: 'eval'
   train_denoiser: False
   train_pde: True
   continue_training: False
   data_file_name: 'data/ks_trajectories_512.h5'
   d: 192
   d_prime: 24
-output_dir: 'src/generation/output/'
-rng_key: 888
-epsilon: 1e-10
-general:
+  T: 1
+  output_dir: 'src/generation/output/'
+  rng_key: 888
+  epsilon: 1e-5
+  time_emb_dim: 16
+train_denoiser:
   batch_size: 512 #32 for runthrough
   total_train_steps: 50 #1_000_000  for runthrough
   eval_every_steps: 10 #100 for runthrough
@@ -20,7 +22,6 @@ general:
   save_interval_steps: 10 #100  for runthrough
   num_batches_per_eval: 1 #10  for runthrough #not defined specifically in the paper
   max_to_keep: 1
-  T: 1
   beta_min: 0.1
   beta_max: 20 
   norm_guide_strength: 1.0
@@ -50,22 +51,26 @@ pde_solver:
   t_low: 1e-10
   nSim_interior: 1000 #Batch size
   nSim_terminal: 1000 #Batch size
-  x_low: 0.0 
-  x_high: 64.0
-  y_low: 0.0
-  y_high: 64.0
-  sampling_stages: 50_000 #100_000 
-  steps_per_sample: 1 #can remove this it seems 
+  x_low: -5.0
+  x_high: 5.0
+  y_low: -5.0
+  y_high: 5.0
+  sampling_stages: 75_000 #100_000 
   type_lr_schedule: sirignano #set to specific value for fixed learning rate
-  constant_lr: 1e-4
-  boundaries: [5000, 10000, 20000, 30000, 40000, 45000]
+  constant_lr: 1e-3
+  boundaries: [25000, 50000]
+  lr_schedules: [1e-3, 5e-4, 1e-4]
   lambda: 1 #to start with
   num_gen_samples: 128 # 128 8 is pde_solver on local machine 15360
   num_conditionings: 16 # 512 aka num_conditions 16 is pde_solver on local machine
+  chunk_size: 250
 DGM:
-  nodes_per_layer: 50
-  num_layers: 3
+  nodes_per_layer: 256
+  num_layers: 5
   N_epochs: 1_250
+ema:
+  ema_decay: 0.999
+  use_ema_eval: True
 easy_examples:
   n_samples_train: 38_400
   n_samples_generate: 20_000
@@ -73,7 +78,8 @@ easy_examples:
 wandb:
   use_wandb: True
 metrics: 
-  log_train_every: 50
+  log_ema_metrics_every: 500
+  log_train_metrics_every: 50
 
 
 

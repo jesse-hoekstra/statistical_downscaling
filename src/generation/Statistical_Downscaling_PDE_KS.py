@@ -102,10 +102,7 @@ class KSStatisticalDownscalingPDESolver(PDE_solver):
         """
 
         def V_single(ts: jax.Array, xs: jax.Array, ys: jax.Array) -> jax.Array:
-            ts_b = ts.reshape(1, 1)
-            xs_b = xs.reshape(1, -1)
-            ys_b = ys.reshape(1, -1)
-            return self.net.apply(params, ts_b, xs_b, ys_b).squeeze()
+            return self.net.apply(params, ts[None], xs[None], ys[None]).squeeze()
 
         dV_dt_fn = jax.grad(lambda ts, xs, ys: V_single(ts, xs, ys))
         dV_dx_fn = jax.grad(lambda xs, ts, ys: V_single(ts, xs, ys))
@@ -148,10 +145,12 @@ class KSStatisticalDownscalingPDESolver(PDE_solver):
         drifts = jax.vmap(_drift)(x_interior, jnp.squeeze(t_interior, -1))
         diffusions = jax.vmap(_half_diffusion2)(x_interior, jnp.squeeze(t_interior, -1))
 
+        grad_norm_sq = jnp.sum(jnp.square(V_x), axis=-1)
+
         PDE_residual = (
             V_t.reshape(-1)
             + jnp.einsum("bd,bd->b", drifts, V_x)
-            + diffusions * trace_term
+            + diffusions * (trace_term + grad_norm_sq)
         ).reshape(-1, 1)
         L1 = jnp.mean(jnp.square(PDE_residual))
 
@@ -160,7 +159,7 @@ class KSStatisticalDownscalingPDESolver(PDE_solver):
 
         diff = Cx - y_terminal
         sqnorm = jnp.sum(jnp.square(diff), axis=-1)
-        target = (1 / self.lambda_value) * jnp.exp(-sqnorm / (self.lambda_value**2))
+        target = -jnp.log(self.lambda_value) - (sqnorm / (self.lambda_value**2))
         target = target.reshape(-1, 1)
         L3 = jnp.mean(jnp.square(V_term - target))
 

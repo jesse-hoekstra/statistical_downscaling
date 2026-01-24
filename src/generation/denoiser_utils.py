@@ -35,7 +35,7 @@ def vp_linear_beta_schedule(beta_min: float = None, beta_max: float = None):
     forward(t) = sqrt(expm1(0.5 * (β_max-β_min) * t^2 + β_min * t)).
 
     If `beta_min`/`beta_max` are not provided, values are read from
-    `run_sett['general']['beta_min']` and `run_sett['general']['beta_max']`.
+    `run_sett['train_denoiser']['beta_min']` and `run_sett['train_denoiser']['beta_max']`.
 
     Args:
         beta_min: Optional lower bound for β. Defaults to config.
@@ -45,10 +45,10 @@ def vp_linear_beta_schedule(beta_min: float = None, beta_max: float = None):
         dfn_lib.InvertibleSchedule with `forward(t)` and `inverse(σ)`.
     """
     beta_min = float(
-        beta_min if beta_min is not None else run_sett["general"]["beta_min"]
+        beta_min if beta_min is not None else run_sett["train_denoiser"]["beta_min"]
     )
     beta_max = float(
-        beta_max if beta_max is not None else run_sett["general"]["beta_max"]
+        beta_max if beta_max is not None else run_sett["train_denoiser"]["beta_max"]
     )
     bdiff = beta_max - beta_min
     forward = lambda t: jnp.sqrt(jnp.expm1(0.5 * bdiff * t * t + beta_min * t))
@@ -134,11 +134,11 @@ def build_model(denoiser_model, diffusion_scheme, data_std: float):
         dfn.DenoisingModel ready for training.
     """
     return dfn.DenoisingModel(
-        input_shape=(int(run_sett["general"]["d"]), 1),
+        input_shape=(int(run_sett["global"]["d"]), 1),
         denoiser=denoiser_model,
         noise_sampling=dfn_lib.time_uniform_sampling(
             diffusion_scheme,
-            clip_min=float(run_sett["general"]["clip_min"]),
+            clip_min=float(run_sett["train_denoiser"]["clip_min"]),
             uniform_grid=True,
         ),
         noise_weighting=dfn_lib.edm_weighting(data_std=data_std),
@@ -159,7 +159,7 @@ def build_trainer(model):
     """
     return dfn.DenoisingTrainer(
         model=model,
-        rng=jax.random.PRNGKey(int(run_sett["rng_key"])),
+        rng=jax.random.PRNGKey(int(run_sett["global"]["rng_key"])),
         optimizer=optax.chain(
             optax.clip_by_global_norm(float(run_sett["optimizer"]["clip_norm"])),
             optax.adam(
@@ -172,7 +172,7 @@ def build_trainer(model):
                 ),
             ),
         ),
-        ema_decay=float(run_sett["general"]["ema_decay"]),
+        ema_decay=float(run_sett["train_denoiser"]["ema_decay"]),
     )
 
 
@@ -187,8 +187,8 @@ def run_training(
     eval_dataloader,
     eval_every_steps: int,
     num_batches_per_eval: int,
-    save_interval_steps: int = run_sett["general"]["save_interval_steps"],
-    max_to_keep: int = run_sett["general"]["max_to_keep"],
+    save_interval_steps: int,
+    max_to_keep: int,
 ):
     """Train the model with standard progress and checkpoint callbacks.
 

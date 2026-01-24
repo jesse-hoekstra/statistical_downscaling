@@ -23,7 +23,7 @@ with open(args.config, "r") as f:
 
 
 def sample_unconditional(
-    diffusion_scheme, denoise_fn, rng_key: jax.Array, num_samples: int
+    diffusion_scheme, denoise_fn, rng_key: jax.Array, num_samples: int, num_plots: int
 ):
     """Generate unconditional samples using an SDE sampler.
 
@@ -32,16 +32,16 @@ def sample_unconditional(
         denoise_fn: Callable denoiser inference function.
         rng_key: JAX PRNG key for sampling.
         num_samples: Number of independent samples to draw.
-
+        num_plots: Number of plots to generate.
     Returns:
         Array of generated samples with shape `(num_samples, d, 1)`.
     """
     sampler = dfn_lib.SdeSampler(
-        input_shape=(run_sett["general"]["d"], 1),
+        input_shape=(run_sett["global"]["d"], 1),
         integrator=solver_lib.EulerMaruyama(),
         tspan=dfn_lib.exponential_noise_decay(
             diffusion_scheme,
-            num_steps=run_sett["exp_tspan"]["num_steps"],
+            num_steps=int(run_sett["exp_tspan"]["num_steps"]),
             end_sigma=float(run_sett["exp_tspan"]["end_sigma"]),
         ),
         scheme=diffusion_scheme,
@@ -51,7 +51,10 @@ def sample_unconditional(
         return_full_paths=False,
     )
     generate = jax.jit(sampler.generate, static_argnames=("num_samples",))
-    return generate(rng=rng_key, num_samples=num_samples)
+    keys = jax.random.split(rng_key, num_samples)
+    batched_generate = jax.vmap(lambda k: generate(rng=k, num_samples=num_plots))
+
+    return batched_generate(keys)
 
 
 def less_memory_sample_wan_guided(
@@ -138,25 +141,25 @@ def sample_wan_guided(
         indexes the `C` conditions in `y_bar`.
     """
 
-    downsampling_factor = int(run_sett["general"]["d"]) // int(
-        run_sett["general"]["d_prime"]
+    downsampling_factor = int(run_sett["global"]["d"]) // int(
+        run_sett["global"]["d_prime"]
     )
     C_prime = jnp.array(
         [
             [
                 1 if j == downsampling_factor * i else 0
-                for j in range(int(run_sett["general"]["d"]))
+                for j in range(int(run_sett["global"]["d"]))
             ]
-            for i in range(int(run_sett["general"]["d_prime"]))
+            for i in range(int(run_sett["global"]["d_prime"]))
         ]
     )
     guidance_transform = LinearConstraint.create(
         C_prime=C_prime,
         y_bar=y_bar,
-        norm_guide_strength=run_sett["general"]["norm_guide_strength"],
+        norm_guide_strength=run_sett["train_denoiser"]["norm_guide_strength"],
     )
     sampler = dfn_lib.SdeSampler(
-        input_shape=(run_sett["general"]["d"], 1),
+        input_shape=(run_sett["global"]["d"], 1),
         integrator=solver_lib.EulerMaruyama(),
         tspan=dfn_lib.exponential_noise_decay(
             diffusion_scheme,
@@ -187,39 +190,39 @@ def sample_pde_guided(
     """Generate samples guided by our additional gradient term.
 
     Uses a custom sampler with drift adjustments provided by
-    `pde_solver.grad_log_h_batched_one_per_model`.
+    `pde_solver.grad_log_h_batched`.
 
     Args:
         diffusion_scheme: Diffusion schedule object.
         denoise_fn: Callable denoiser inference function.
-        pde_solver: Solver exposing `grad_log_h_batched_one_per_model` and
+        pde_solver: Solver exposing `grad_log_h_batched` and
             attribute `num_models`.
         rng_key: JAX PRNG key for sampling.
         samples_per_condition: Number of batches; each batch generates
-            `pde_solver.num_models` samples.
+            `pde_solver.num_conditionings` samples.
         y: Target low-resolution conditions; shape `(M, d')` or `(M, d', 1)`
-           where `M == pde_solver.num_models`.
+           where `M == pde_solver.num_conditionings`.
 
     Returns:
         Array with shape `(samples_per_condition, M, d, 1)`.
     """
-    num_models = int(pde_solver.num_models)
-    if y.shape[0] != num_models:
+    num_conditionings = int(pde_solver.num_conditionings)
+    if y.shape[0] != num_conditionings:
         raise ValueError(
-            f"`y` must have leading size {num_models}, but got {y.shape[0]}"
+            f"`y` must have leading size {num_conditionings}, but got {y.shape[0]}"
         )
     sampler = NewDriftSdeSampler(
-        input_shape=(run_sett["general"]["d"], 1),
+        input_shape=(pde_solver.run_sett_global["d"], 1),
         integrator=solver_lib.EulerMaruyama(),
         tspan=dfn_lib.exponential_noise_decay(
             diffusion_scheme,
-            num_steps=int(run_sett["exp_tspan"]["num_steps"]),
-            end_sigma=float(run_sett["exp_tspan"]["end_sigma"]),
+            num_steps=int(pde_solver.run_sett_exp_tspan["num_steps"]),
+            end_sigma=float(pde_solver.run_sett_exp_tspan["end_sigma"]),
         ),
         scheme=diffusion_scheme,
         denoise_fn=denoise_fn,
         guidance_transforms=(),
-        guidance_fn=pde_solver.grad_log_h_batched_one_per_model,
+        guidance_fn=pde_solver.grad_log_h_batched,
         apply_denoise_at_end=True,
         return_full_paths=False,
     )
@@ -228,7 +231,7 @@ def sample_pde_guided(
     keys = jax.random.split(rng_key, samples_per_condition)
     generate_one = jax.jit(
         lambda k: sampler.generate(
-            rng=k, num_samples=num_models, guidance_inputs={"y": y}
+            rng=k, num_samples=num_conditionings, guidance_inputs={"y": y}
         )
     )
 

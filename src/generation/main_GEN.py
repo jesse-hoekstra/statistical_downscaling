@@ -73,6 +73,9 @@ run_sett["global"]["work_dir"] = work_dir
 writer = None
 key_suffix = ""
 
+mode = str(run_sett["global"]["mode"])
+use_ema_eval = bool(run_sett["ema"]["use_ema_eval"])
+
 if use_wandb:
     base_writer = metric_writers.create_default_writer(work_dir, asynchronous=False)
 
@@ -82,7 +85,6 @@ if use_wandb:
     if gpu_tag_env and gpu_tag_env not in run_name:
         run_name = f"{run_name}_{gpu_tag_env}"
     key_suffix = f"_{gpu_tag_env}" if gpu_tag_env else ""
-    mode = str(run_sett["global"]["mode"])
 
     writer = WandbWriter(
         base_writer,
@@ -116,7 +118,23 @@ def _load_samples_h5(path, *, as_jax=True):
     return jnp.asarray(samples_np) if as_jax else samples_np
 
 
+def _build_C_prime(d: int, d_prime: int) -> jax.Array:
+    downsampling_factor = d // d_prime
+
+    return jnp.array(
+        [
+            [1 if j == downsampling_factor * i else 0 for j in range(d)]
+            for i in range(d_prime)
+        ]
+    ).astype(jnp.float32)
+
+
 def main():
+    if use_ema_eval:
+        print("✓ EMA eval: ON")
+    else:
+        print("EMA eval: OFF")
+
     if mode == "train":
         print("✓ Running in training mode.")
     elif mode == "sample":
@@ -127,35 +145,40 @@ def main():
         raise ValueError(f"Invalid mode: {mode}")
 
     u_HFHR, u_LFLR, u_HFLR, x, t = get_raw_datasets(
-        file_name=run_sett["general"]["data_file_name"]
+        file_name=run_sett["global"]["data_file_name"]
     )
     u_LFLR = u_LFLR[
         :, :, ::2
     ]  # they do this but don't explicitly mention it, note now we need a d_prime of 24
 
-    u_hfhr_samples = u_HFHR.reshape(-1, int(run_sett["general"]["d"]), 1)
-    u_lflr_samples = u_LFLR.reshape(-1, int(run_sett["general"]["d_prime"]), 1)
+    u_hfhr_samples = u_HFHR.reshape(-1, int(run_sett["global"]["d"]), 1)
+    u_lflr_samples = u_LFLR.reshape(-1, int(run_sett["global"]["d_prime"]), 1)
     DATA_STD = u_hfhr_samples.std()
 
     denoiser_model = create_denoiser_model()
     diffusion_scheme = create_diffusion_scheme(DATA_STD)
 
-    num_conditionings = int(run_sett["pde_solver"]["num_conditionings"])
-    log_train_every = int(run_sett["metrics"]["log_train_every"])
-    seed = int(run_sett["global"]["seed"])
+    run_sett_train_denoiser = run_sett["train_denoiser"]
+    run_sett_pde_solver = run_sett["pde_solver"]
+    run_sett_global = run_sett["global"]
+    run_sett_metrics = run_sett["metrics"]
+
+    num_conditionings = int(run_sett_pde_solver["num_conditionings"])
+    log_train_metrics_every = int(run_sett_metrics["log_train_metrics_every"])
+    log_ema_metrics_every = int(run_sett_metrics["log_ema_metrics_every"])
+    seed = int(run_sett_global["seed"])
 
     if mode == "train":
-        lambda_value = float(run_sett["pde_solver"]["lambda"])
         if run_sett["global"]["train_denoiser"]:
-            batch_size = int(run_sett["general"]["batch_size"])
-            total_train_steps = int(run_sett["general"]["total_train_steps"])
+            batch_size = int(run_sett_train_denoiser["batch_size"])
+            total_train_steps = int(run_sett_train_denoiser["total_train_steps"])
             metric_aggregation_steps = int(
-                run_sett["general"]["metric_aggregation_steps"]
+                run_sett_train_denoiser["metric_aggregation_steps"]
             )
-            eval_every_steps = int(run_sett["general"]["eval_every_steps"])
-            num_batches_per_eval = int(run_sett["general"]["num_batches_per_eval"])
-            save_interval_steps = int(run_sett["general"]["save_interval_steps"])
-            max_to_keep = int(run_sett["general"]["max_to_keep"])
+            eval_every_steps = int(run_sett_train_denoiser["eval_every_steps"])
+            num_batches_per_eval = int(run_sett_train_denoiser["num_batches_per_eval"])
+            save_interval_steps = int(run_sett_train_denoiser["save_interval_steps"])
+            max_to_keep = int(run_sett_train_denoiser["max_to_keep"])
 
             model = build_model(denoiser_model, diffusion_scheme, DATA_STD)
             trainer = build_trainer(model)
@@ -195,24 +218,30 @@ def main():
                 rng_key=jax.random.PRNGKey(seed),
             )
             key_master = jax.random.PRNGKey(seed)
-            RNG_NAMESPACE = run_sett["global"]["RNG_NAMESPACE"]
+            RNG_NAMESPACE = run_sett_global["RNG_NAMESPACE"]
             for it in range(pde_solver.sampling_stages):
                 key_step = jax.random.fold_in(key_master, RNG_NAMESPACE + it)
                 train_metrics = pde_solver.update_params(key_step)
                 global_step = int(pde_solver._step)
                 if use_wandb:
                     scalars = {}
-                    if (global_step % log_train_every) == 0:
+                    if (global_step % log_train_metrics_every) == 0:
                         scalars.update(
                             {f"train/{k}": float(v) for k, v in train_metrics.items()}
                         )
-                    writer.write_scalars(step=global_step, scalars=scalars)
+                    if use_ema_eval and (global_step % log_ema_metrics_every) == 0:
+                        ema_metrics = pde_solver.compute_ema_metrics(key_step)
+                        scalars.update(
+                            {f"eval/{k}": float(v) for k, v in ema_metrics.items()}
+                        )
+                    if scalars:
+                        writer.write_scalars(step=global_step, scalars=scalars)
             pde_params_dir = os.path.join(work_dir, "checkpoints_pde_solver")
             pde_solver.save_params(pde_params_dir)
     elif mode == "sample":
         y = u_lflr_samples[:num_conditionings]
-        generation_type = str(run_sett["global"]["generation_type"])
-        num_gen_samples = int(run_sett["pde_solver"]["num_gen_samples"])
+        generation_type = str(run_sett_global["generation_type"])
+        num_gen_samples = int(run_sett_pde_solver["num_gen_samples"])
 
         jax.config.update(
             "jax_enable_x64", True
@@ -227,6 +256,7 @@ def main():
                 denoise_fn,
                 jax.random.PRNGKey(seed),
                 num_samples=num_gen_samples,
+                num_plots=num_conditionings,
             )
             print(jnp.mean(samples))
             print(samples.std())
@@ -274,39 +304,29 @@ def main():
             print(samples.shape)
             _save_samples_h5(sample_file, samples)
     elif mode == "eval":
-
         jax.config.update("jax_enable_x64", True)
-        downsampling_factor = int(run_sett["general"]["d"]) // int(
-            run_sett["general"]["d_prime"]
-        )
-        C_prime = jnp.array(
-            [
-                [
-                    1 if j == downsampling_factor * i else 0
-                    for j in range(int(run_sett["general"]["d"]))
-                ]
-                for i in range(int(run_sett["general"]["d_prime"]))
-            ]
-        )
+        C_prime = _build_C_prime(run_sett_global["d"], run_sett_global["d_prime"])
 
-        sample_file = os.path.join(work_dir, f"samples_{run_sett['option']}.h5")
+        sample_file = os.path.join(
+            work_dir, f"samples_{run_sett_global['generation_type']}.h5"
+        )
         samples = _load_samples_h5(sample_file, as_jax=True)
 
         constraint_rmse = calculate_constraint_rmse(
             samples,
-            u_lflr_samples[0 : int(run_sett["pde_solver"]["num_conditionings"])],
+            u_lflr_samples[0 : int(run_sett_pde_solver["num_conditionings"])],
             C_prime,
         )
         kld = calculate_kld_pooled(
-            samples, u_hfhr_samples, epsilon=float(run_sett["epsilon"])
+            samples, u_hfhr_samples, epsilon=float(run_sett_global["epsilon"])
         )
         sample_variability = calculate_sample_variability(samples)
         melr_weighted = calculate_melr_pooled(
             samples,
             u_hfhr_samples,
-            sample_shape=(run_sett["general"]["d"],),
+            sample_shape=(run_sett_global["d"],),
             weighted=True,
-            epsilon=float(run_sett["epsilon"]),
+            epsilon=float(run_sett_global["epsilon"]),
         )
 
         # import numpy as np
@@ -327,9 +347,9 @@ def main():
         melr_unweighted = calculate_melr_pooled(
             samples,
             u_hfhr_samples,
-            sample_shape=(run_sett["general"]["d"],),
+            sample_shape=(run_sett_global["d"],),
             weighted=False,
-            epsilon=float(run_sett["epsilon"]),
+            epsilon=float(run_sett_global["epsilon"]),
         )
 
         wass1 = calculate_wass1_pooled(

@@ -14,6 +14,17 @@ import orbax.checkpoint as ocp
 import os
 
 
+def _build_C_prime(d: int, d_prime: int) -> jax.Array:
+    downsampling_factor = d // d_prime
+
+    return jnp.array(
+        [
+            [1 if j == downsampling_factor * i else 0 for j in range(d)]
+            for i in range(d_prime)
+        ]
+    ).astype(jnp.float32)
+
+
 class PDE_solver:
     """Base class for PDE solvers.
 
@@ -34,11 +45,19 @@ class PDE_solver:
         self.run_sett_pde_solver = settings["pde_solver"]
         self.run_sett_global = settings["global"]
         self.run_sett_dgm = settings["DGM"]
+        self.run_sett_exp_tspan = settings["exp_tspan"]
+        self.run_sett_ema = settings["ema"]
 
         self.seed = int(self.run_sett_global["seed"])
         self.T = float(self.run_sett_global["T"])
         self.d = int(self.run_sett_global["d"])
         self.d_prime = int(self.run_sett_global["d_prime"])
+        self.time_emb_dim = int(self.run_sett_global["time_emb_dim"])
+
+        self.C_prime = _build_C_prime(self.d, self.d_prime)
+
+        self.ema_decay = float(self.run_sett_ema["ema_decay"])
+        self.use_ema_eval = bool(self.run_sett_ema["use_ema_eval"])
 
         self.t_low = float(self.run_sett_pde_solver["t_low"])
         self.x_low = float(self.run_sett_pde_solver["x_low"])
@@ -48,16 +67,18 @@ class PDE_solver:
         self.nSim_interior = int(self.run_sett_pde_solver["nSim_interior"])
         self.nSim_terminal = int(self.run_sett_pde_solver["nSim_terminal"])
         self.sampling_stages = int(self.run_sett_pde_solver["sampling_stages"])
-        self.steps_per_sample = int(self.run_sett_pde_solver["steps_per_sample"])
         self.num_conditionings = int(self.run_sett_pde_solver["num_conditionings"])
+        self.chunk_size = int(self.run_sett_pde_solver["chunk_size"])
 
         # DGM network
         hidden = int(self.run_sett_dgm["nodes_per_layer"])
         n_layers = int(self.run_sett_dgm["num_layers"])
         self.net = DGMNetJax(
-            input_dim=self.d + self.d_prime,
+            input_dim=self.d + self.d_prime + self.time_emb_dim,
+            time_emb_dim=self.time_emb_dim,
             layer_width=hidden,
             num_layers=n_layers,
+            C_prime=self.C_prime,
             final_trans=None,
         )
 
@@ -66,31 +87,27 @@ class PDE_solver:
         x0 = jnp.zeros((1, self.d), dtype=jnp.float32)
         y0 = jnp.zeros((1, self.d_prime), dtype=jnp.float32)
         self.params = self.net.init(jax.random.PRNGKey(self.seed), t0, x0, y0)
-        self.opt_state = self.optimizer.init(self.params)
+
+        self.ema_params = jax.tree_util.tree_map(lambda x: x, self.params)
 
         # Optimizer
         self.learning_rate = self._build_lr_schedule()
         self.optimizer = optax.adam(self.learning_rate)
 
+        self.opt_state = self.optimizer.init(self.params)
+
         self._step = 0
 
     def _build_lr_schedule(self):
         """Create learning-rate schedule (constant or cosine with warmup/decay)."""
-        boundaries = self.settings["pde_solver"]["boundaries"]
-        constant_lr = float(self.settings["pde_solver"]["constant_lr"])
-        mode_type = str(self.settings["pde_solver"]["type_lr_schedule"]).lower()
+        boundaries = self.run_sett_pde_solver["boundaries"]
+        constant_lr = float(self.run_sett_pde_solver["constant_lr"])
+        lr_schedules = self.run_sett_pde_solver["lr_schedules"]
+        mode_type = str(self.run_sett_pde_solver["type_lr_schedule"]).lower()
         if mode_type == "constant":
             return optax.constant_schedule(constant_lr)
         elif mode_type == "sirignano":
-            schedules = [
-                optax.constant_schedule(1e-4),
-                optax.constant_schedule(5e-4),
-                optax.constant_schedule(1e-5),
-                optax.constant_schedule(5e-6),
-                optax.constant_schedule(1e-6),
-                optax.constant_schedule(5e-7),
-                optax.constant_schedule(1e-7),
-            ]
+            schedules = [optax.constant_schedule(float(lr)) for lr in lr_schedules]
             return optax.join_schedules(schedules=schedules, boundaries=boundaries)
 
     def sampler(self, key):
@@ -103,35 +120,45 @@ class PDE_solver:
             Interior targets are sampled from a uniform distribution over `[x_low, x_high]`.
             Terminal targets are sampled from a uniform distribution over `[x_low, x_high]`.
         """
-        key, k1, k2, k3, k4, k5 = jax.random.split(key, 6)
+        k1, k2, k3, k4, k5, k6, k7 = jax.random.split(key, 7)
+        split_ratio = 0.5  # to ensure it sees a part not close to manifold as well
+
+        num_coupled = int(self.nSim_interior * split_ratio)
+        num_uniform = self.nSim_interior - num_coupled
+
         t_interior = jax.random.uniform(
-            k1, shape=(self.nSim_interior, 1), minval=self.t_low, maxval=self.T
+            k1, (self.nSim_interior, 1), minval=self.t_low, maxval=self.T
         )
         x_interior = jax.random.uniform(
-            k2,
-            shape=(self.nSim_interior, self.d),
-            minval=self.x_low,
-            maxval=self.x_high,
+            k2, (self.nSim_interior, self.d), minval=self.x_low, maxval=self.x_high
         )
-        y_interior = jax.random.uniform(
-            k3,
-            shape=(self.nSim_interior, self.d_prime),
-            minval=self.x_low,
-            maxval=self.x_high,
+
+        std_scale_interior = 0.005 * jnp.std(x_interior)
+        y_int_coupled = (
+            x_interior[:num_coupled] @ self.C_prime.T
+        ) + std_scale_interior * jax.random.normal(k3, (num_coupled, self.d_prime))
+        y_int_uniform = jax.random.uniform(
+            k4, (num_uniform, self.d_prime), minval=self.y_low, maxval=self.y_high
         )
-        t_terminal = jnp.ones((self.nSim_terminal, 1), dtype=jnp.float32) * self.T
+        y_interior = jnp.concatenate([y_int_coupled, y_int_uniform], axis=0)
+
+        num_term_coupled = int(self.nSim_terminal * split_ratio)
+        num_term_uniform = self.nSim_terminal - num_term_coupled
+
+        t_terminal = jnp.ones((self.nSim_terminal, 1)) * self.T
         x_terminal = jax.random.uniform(
-            k4,
-            shape=(self.nSim_terminal, self.d),
-            minval=self.x_low,
-            maxval=self.x_high,
+            k5, (self.nSim_terminal, self.d), minval=self.x_low, maxval=self.x_high
         )
-        y_terminal = jax.random.uniform(
-            k5,
-            shape=(self.nSim_terminal, self.d_prime),
-            minval=self.y_low,
-            maxval=self.y_high,
+
+        std_scale_terminal = 0.005 * jnp.std(x_terminal)
+        y_term_coupled = (
+            x_terminal[:num_term_coupled] @ self.C_prime.T
+        ) + std_scale_terminal * jax.random.normal(k6, (num_term_coupled, self.d_prime))
+        y_term_uniform = jax.random.uniform(
+            k7, (num_term_uniform, self.d_prime), minval=self.y_low, maxval=self.y_high
         )
+        y_terminal = jnp.concatenate([y_term_coupled, y_term_uniform], axis=0)
+
         return t_interior, x_interior, y_interior, t_terminal, x_terminal, y_terminal
 
     @partial(jax.jit, static_argnums=0)
@@ -168,29 +195,47 @@ class PDE_solver:
             log_fn: Optional callable receiving a dict of scalar metrics once
                 per sampling stage.
         """
-        t_interior, x_interior, y_interior, t_terminal, x_terminal, y_terminal = (
-            self.sampler(key)
-        )
-        for _ in range(self.steps_per_sample):
+        batch = self.sampler(key)
+        chunk_size = int(self.chunk_size)
+        num_chunks = self.nSim_interior // chunk_size
 
-            def loss_and_aux(p):
-                return self.loss_fn(
-                    p,
-                    t_interior,
-                    x_interior,
-                    y_interior,
-                    t_terminal,
-                    x_terminal,
-                    y_terminal,
-                )
+        def loss_and_aux(p, *batch_slice):
+            return self.loss_fn(p, *batch_slice)
 
+        accumulated_grads = None
+        total_aux = None
+
+        for i in range(num_chunks):
+            start = i * chunk_size
+            end = (i + 1) * chunk_size
+            batch_slice = (arr[start:end] for arr in batch)
             (loss_val, aux), grads = jax.value_and_grad(loss_and_aux, has_aux=True)(
-                self.params
+                self.params, *batch_slice
             )
+            if accumulated_grads is None:
+                accumulated_grads = jax.tree_util.tree_map(
+                    lambda g: g / num_chunks, grads
+                )
+                total_aux = {k: v / num_chunks for k, v in aux.items()}
+            else:
+                accumulated_grads = jax.tree_util.tree_map(
+                    lambda acc, g: acc + (g / num_chunks), accumulated_grads, grads
+                )
+                for k in total_aux:
+                    total_aux[k] += aux[k] / num_chunks
 
-            updates, self.opt_state = self.optimizer.update(grads, self.opt_state)
-            self.params = optax.apply_updates(self.params, updates)
-        return aux
+        updates, self.opt_state = self.optimizer.update(
+            accumulated_grads, self.opt_state
+        )
+        self.params = optax.apply_updates(self.params, updates)
+
+        self.ema_params = jax.tree_util.tree_map(
+            lambda e, p: self.ema_decay * e + (1.0 - self.ema_decay) * p,
+            self.ema_params,
+            self.params,
+        )
+
+        return total_aux
 
     def update_params(self, key):
         """Advance training by one step and return scalar metrics."""
@@ -211,20 +256,17 @@ class PDE_solver:
         t = t.reshape(1, 1)
 
         def loss(xs, ys):
-            h = self.net.apply(params, t, xs, ys).squeeze(-1)
-            return jnp.sum(jnp.log(jnp.maximum(h, 1e-6)))
+            return self.net.apply(params, t, xs, ys).squeeze()  # outputs log directly.
 
         return jax.grad(loss)(x_flat, y_flat)
 
     @partial(jax.jit, static_argnums=0)
     def grad_log_h(self, x: jax.Array, y: jax.Array, t: jax.Array) -> jax.Array:
         """Compute `grad_log_h`."""
-        return self.grad_log_h_params(self.params, x, y, t)
+        return self.grad_log_h_params(self.ema_params, x, y, t)
 
     @partial(jax.jit, static_argnums=0)
-    def grad_log_h_batched_one_per_model(
-        self, x: jax.Array, y: jax.Array, t: jax.Array
-    ) -> jax.Array:
+    def grad_log_h_batched(self, x: jax.Array, y: jax.Array, t: jax.Array) -> jax.Array:
         """Compute grad_log_h for a batch where sample i uses conditioning i.
 
         Args:
@@ -244,12 +286,34 @@ class PDE_solver:
             t = t.reshape(M, 1)
 
         def per_sample(xs, ys, ts):
-            return self.grad_log_h_params(self.params, xs, ys, ts)
+            return self.grad_log_h_params(self.ema_params, xs, ys, ts)
 
         grads = jax.vmap(per_sample)(x_flat, y_flat, t)
         if grads.ndim == 3 and grads.shape[1] == 1:
             grads = jnp.squeeze(grads, axis=1)
         return grads
+
+    def compute_ema_metrics(self, key):
+        """Compute metrics using EMA params."""
+        batch = self.sampler(key)
+
+        chunk_size = int(self.chunk_size)
+        num_chunks = self.nSim_interior // chunk_size
+        total_ema_aux = None
+
+        for i in range(num_chunks):
+            start = i * chunk_size
+            end = (i + 1) * chunk_size
+            batch_slice = tuple(arr[start:end] for arr in batch)
+            _, aux = self.loss_fn(self.ema_params, *batch_slice)
+
+            if total_ema_aux is None:
+                total_ema_aux = {k: v / num_chunks for k, v in aux.items()}
+            else:
+                for k in total_ema_aux:
+                    total_ema_aux[k] += aux[k] / num_chunks
+
+        return {f"eval/{k}": float(v) for k, v in total_ema_aux.items()}
 
     def save_params(self, ckpt_dir: str):
         """Save current params_list and opt_state_list to a checkpoint directory.
@@ -265,6 +329,7 @@ class PDE_solver:
         )
         payload = {
             "params": self.params,
+            "ema_params": self.ema_params,
             "opt_state": self.opt_state,
         }
         current_step = self._step
@@ -284,6 +349,7 @@ class PDE_solver:
                 return False
             target_item = {
                 "params": self.params,
+                "ema_params": self.ema_params,
                 "opt_state": self.opt_state,
             }
 
@@ -292,6 +358,7 @@ class PDE_solver:
             )
 
             self.params = restored["params"]
+            self.ema_params = restored["ema_params"]
             self.opt_state = restored["opt_state"]
 
             self._step = latest_step
