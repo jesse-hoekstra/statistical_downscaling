@@ -73,6 +73,31 @@ class KSStatisticalDownscalingPDESolver(PDE_solver):
         self.scheme = scheme
         self.denoise_fn = denoise_fn
         self.lambda_value = jnp.float32(self.run_sett_pde_solver["lambda"])
+        self.normalize_data = bool(self.run_sett_pde_solver["normalize_data"])
+        if self.normalize_data:
+            self.x_mean, self.x_std, self.y_mean, self.y_std = self._calibrate_data(
+                samples
+            )
+        else:
+            self.x_mean = jnp.zeros(self.d)
+            self.x_std = jnp.ones(self.d)
+            self.y_mean = jnp.zeros(self.d_prime)
+            self.y_std = jnp.ones(self.d_prime)
+
+    def _calibrate_data(self, samples):
+        x_mean = jnp.mean(samples.squeeze(-1), axis=0)
+        x_std = jnp.std(samples.squeeze(-1), axis=0) + 1e-6
+
+        samples_y = jnp.matmul(samples.squeeze(-1), self.C_prime.T)
+        y_mean = jnp.mean(samples_y, axis=0)
+        y_std = jnp.std(samples_y, axis=0) + 1e-6
+        return x_mean, x_std, y_mean, y_std
+
+    def _normalize_data(self, x, y):
+        return (x - self.x_mean) / self.x_std, (y - self.y_mean) / self.y_std
+
+    def _denormalize_data(self, x_norm, y_norm):
+        return x_norm * self.x_std + self.x_mean, y_norm * self.y_std + self.y_mean
 
     @partial(jax.jit, static_argnums=0)
     def loss_fn(
@@ -101,28 +126,45 @@ class KSStatisticalDownscalingPDESolver(PDE_solver):
             `L3` enforces the terminal constraint via a smooth kernel.
         """
 
+        x_interior_norm, y_interior_norm = self._normalize_data(x_interior, y_interior)
+
         def V_single(ts: jax.Array, xs: jax.Array, ys: jax.Array) -> jax.Array:
             return self.net.apply(params, ts[None], xs[None], ys[None]).squeeze()
 
         dV_dt_fn = jax.grad(lambda ts, xs, ys: V_single(ts, xs, ys))
         dV_dx_fn = jax.grad(lambda xs, ts, ys: V_single(ts, xs, ys))
-        H_fn = jax.hessian(lambda xs, ts, ys: V_single(ts, xs, ys))
 
         V_t = jax.vmap(lambda ts, xs, ys: dV_dt_fn(ts.squeeze(), xs, ys))(
             t_interior,
-            x_interior,
-            y_interior,
+            x_interior_norm,
+            y_interior_norm,
         )
-        V_x = jax.vmap(lambda ts, xs, ys: dV_dx_fn(xs, ts.squeeze(), ys))(
+        V_x_norm = jax.vmap(lambda ts, xs, ys: dV_dx_fn(xs, ts.squeeze(), ys))(
             t_interior,
-            x_interior,
-            y_interior,
-        )
-        V_xx = jax.vmap(lambda ts, xs, ys: H_fn(xs, ts.squeeze(), ys))(
-            t_interior, x_interior, y_interior
+            x_interior_norm,
+            y_interior_norm,
         )
 
-        trace_term = jax.vmap(lambda m: jnp.trace(m))(V_xx)
+        inv_sigma_sq = 1 / self.x_std**2
+
+        def _laplacian_exact(ts, xs, ys, inv_sigma_sq):
+            grad_f = jax.grad(f)
+
+            def f(x):
+                return V_single(ts, x, ys)
+
+            eye = jnp.eye(xs.shape[-1], dtype=xs.dtype)
+
+            def diag_second(ei):
+                _, hv = jax.jvp(grad_f, (xs,), (ei,))
+                return jnp.vdot(ei, hv) * jnp.vdot(ei, inv_sigma_sq)
+
+            return jnp.sum(jax.vmap(diag_second)(eye))
+
+        trace_term = jax.vmap(
+            lambda ts, xs, ys: _laplacian_exact(ts.squeeze(), xs, ys, inv_sigma_sq)
+        )(t_interior, x_interior_norm, y_interior_norm)
+        V_x = V_x_norm / self.x_std
 
         def _drift(x: Array, t: Array) -> Array:
             x = x[None, ..., None]
@@ -154,9 +196,11 @@ class KSStatisticalDownscalingPDESolver(PDE_solver):
         ).reshape(-1, 1)
         L1 = jnp.mean(jnp.square(PDE_residual))
 
-        V_term = self.net.apply(params, t_terminal, x_terminal, y_terminal)
-        Cx = x_terminal @ self.C_prime.T
+        x_terminal_norm, y_terminal_norm = self._normalize_data(x_terminal, y_terminal)
 
+        V_term = self.net.apply(params, t_terminal, x_terminal_norm, y_terminal_norm)
+
+        Cx = x_terminal @ self.C_prime.T
         diff = Cx - y_terminal
         sqnorm = jnp.sum(jnp.square(diff), axis=-1)
         target = -jnp.log(self.lambda_value) - (sqnorm / (self.lambda_value**2))
@@ -167,6 +211,9 @@ class KSStatisticalDownscalingPDESolver(PDE_solver):
             "L1_loss": L1,
             "L3_loss": L3,
             "total_loss": (L1 + L3),
+            "log_L1": jnp.log(L1 + 1e-6),
+            "log_L3": jnp.log(L3 + 1e-6),
+            "log_total": jnp.log(L1 + L3 + 1e-6),
         }
         loss_val = L1 + L3
         return loss_val, aux

@@ -2,7 +2,7 @@ global:
   seed: 888
   RNG_NAMESPACE: 20260115
   generation_type: 'conditional'
-  mode: 'eval'
+  mode: 'train'
   train_denoiser: False
   train_pde: True
   continue_training: False
@@ -44,6 +44,8 @@ optimizer:
   decay_steps: 990_000
   end_value: 1e-6
   clip_norm: 1.0
+  clip_gradient: 200_000.0
+  use_clip_gradient: False
 exp_tspan:
   num_steps: 256
   end_sigma: 1e-2 #not defined specifically in the paper
@@ -55,15 +57,18 @@ pde_solver:
   x_high: 5.0
   y_low: -5.0
   y_high: 5.0
-  sampling_stages: 75_000 #100_000 
+  sampling_stages: 100_000 
   type_lr_schedule: sirignano #set to specific value for fixed learning rate
   constant_lr: 1e-3
-  boundaries: [25000, 50000]
-  lr_schedules: [1e-3, 5e-4, 1e-4]
+  boundaries: [25_000, 50_000, 75_000]
+  lr_schedules: [1e-3, 5e-4, 1e-4, 5e-5]
   lambda: 1 #to start with
   num_gen_samples: 128 # 128 8 is pde_solver on local machine 15360
   num_conditionings: 16 # 512 aka num_conditions 16 is pde_solver on local machine
-  chunk_size: 250
+  chunk_size: 50
+  adaptive_balancing_loss: False
+  lambda_smooth_alpha: 0.1
+  normalize_data: True
 DGM:
   nodes_per_layer: 256
   num_layers: 5

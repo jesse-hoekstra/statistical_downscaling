@@ -75,6 +75,10 @@ key_suffix = ""
 
 mode = str(run_sett["global"]["mode"])
 use_ema_eval = bool(run_sett["ema"]["use_ema_eval"])
+use_clip_gradient = bool(run_sett["optimizer"]["use_clip_gradient"])
+clip_gradient = float(run_sett["optimizer"]["clip_gradient"])
+adaptive_balancing_loss = bool(run_sett["pde_solver"]["adaptive_balancing_loss"])
+normalize_data = bool(run_sett["pde_solver"]["normalize_data"])
 
 if use_wandb:
     base_writer = metric_writers.create_default_writer(work_dir, asynchronous=False)
@@ -134,7 +138,18 @@ def main():
         print("✓ EMA eval: ON")
     else:
         print("EMA eval: OFF")
-
+    if use_clip_gradient:
+        print(f"✓ Gradient clipping: ON with clip value {clip_gradient}")
+    else:
+        print("Gradient clipping: OFF")
+    if adaptive_balancing_loss:
+        print("✓ Adaptive balancing loss: ON")
+    else:
+        print("Adaptive balancing loss: OFF")
+    if normalize_data:
+        print("✓ Normalize data: ON")
+    else:
+        print("Normalize data: OFF")
     if mode == "train":
         print("✓ Running in training mode.")
     elif mode == "sample":
@@ -328,21 +343,6 @@ def main():
             weighted=True,
             epsilon=float(run_sett_global["epsilon"]),
         )
-
-        # import numpy as np
-        # import matplotlib.pyplot as plt
-        # Er = np.asarray(jax.device_get(E_ref))
-        ##Ep = np.asarray(jax.device_get(E_pred))
-        # k = np.arange(1, Ep.shape[0] + 1, dtype=float)
-        # plt.figure(figsize=(5.0, 3.6), dpi=150)
-        # plt.loglog(k, Er, "k-", label="Reference", linewidth=2.0)
-        # plt.loglog(k, Ep, color="tab:red", label="Predicted", linewidth=2.0)
-        # plt.xlabel(r"$k$")
-        # plt.ylabel(r"$E(k)$")
-        # plt.grid(True, which="both", ls="--", alpha=0.3)
-        # plt.legend()
-        # plt.tight_layout()
-        # plt.show()
 
         melr_unweighted = calculate_melr_pooled(
             samples,

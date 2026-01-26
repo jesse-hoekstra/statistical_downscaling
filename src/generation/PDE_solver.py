@@ -47,6 +47,7 @@ class PDE_solver:
         self.run_sett_dgm = settings["DGM"]
         self.run_sett_exp_tspan = settings["exp_tspan"]
         self.run_sett_ema = settings["ema"]
+        self.run_sett_optimizer = settings["optimizer"]
 
         self.seed = int(self.run_sett_global["seed"])
         self.T = float(self.run_sett_global["T"])
@@ -92,11 +93,26 @@ class PDE_solver:
 
         # Optimizer
         self.learning_rate = self._build_lr_schedule()
-        self.optimizer = optax.adam(self.learning_rate)
-
+        self.clip_gradient = float(self.run_sett_optimizer["clip_gradient"])
+        self.use_clip_gradient = bool(self.run_sett_optimizer["use_clip_gradient"])
+        if bool(self.use_clip_gradient):
+            self.optimizer = optax.chain(
+                optax.clip_by_global_norm(self.clip_gradient),
+                optax.adam(self.learning_rate),
+            )
+        else:
+            self.optimizer = optax.adam(self.learning_rate)
         self.opt_state = self.optimizer.init(self.params)
 
+        self.adaptive_balancing_loss = bool(
+            self.run_sett_pde_solver["adaptive_balancing_loss"]
+        )
+        self.lambda_smooth_alpha = float(
+            self.run_sett_pde_solver["lambda_smooth_alpha"]
+        )
+
         self._step = 0
+        self.lambda_L1 = 1.0
 
     def _build_lr_schedule(self):
         """Create learning-rate schedule (constant or cosine with warmup/decay)."""
@@ -185,6 +201,15 @@ class PDE_solver:
         """
         raise NotImplementedError("loss_fn must be implemented by subclasses")
 
+    @partial(jax.jit, static_argnums=0)
+    def _l1_value_and_aux(self, params, *batch_slice):
+        loss_val, aux = self.loss_fn(params, *batch_slice)
+        return aux["L1_loss"], aux
+
+    @partial(jax.jit, static_argnums=0)
+    def _l3_loss_value(self, params, *batch_slice):
+        return self.loss_fn(params, *batch_slice)[1]["L3_loss"]
+
     def _train_step(self, key):
         """Train the network using SGD/Adam over sampled batches.
 
@@ -199,30 +224,81 @@ class PDE_solver:
         chunk_size = int(self.chunk_size)
         num_chunks = self.nSim_interior // chunk_size
 
-        def loss_and_aux(p, *batch_slice):
-            return self.loss_fn(p, *batch_slice)
-
+        accumulated_grads_l1 = None
+        accumulated_grads_l3 = None
         accumulated_grads = None
         total_aux = None
 
         for i in range(num_chunks):
-            start = i * chunk_size
-            end = (i + 1) * chunk_size
-            batch_slice = (arr[start:end] for arr in batch)
-            (loss_val, aux), grads = jax.value_and_grad(loss_and_aux, has_aux=True)(
-                self.params, *batch_slice
-            )
-            if accumulated_grads is None:
-                accumulated_grads = jax.tree_util.tree_map(
-                    lambda g: g / num_chunks, grads
-                )
-                total_aux = {k: v / num_chunks for k, v in aux.items()}
+            start, end = i * chunk_size, (i + 1) * chunk_size
+            batch_slice = tuple(arr[start:end] for arr in batch)
+
+            if self.adaptive_balancing_loss:
+                (l1_val, aux), g_l1 = jax.value_and_grad(
+                    self._l1_value_and_aux, has_aux=True
+                )(self.params, *batch_slice)
+                g_l3 = jax.grad(self._l3_loss_value)(self.params, *batch_slice)
+
+                if accumulated_grads_l1 is None:
+                    accumulated_grads_l1 = jax.tree_util.tree_map(
+                        lambda g: g / num_chunks, g_l1
+                    )
+                    accumulated_grads_l3 = jax.tree_util.tree_map(
+                        lambda g: g / num_chunks, g_l3
+                    )
+                    total_aux = {k: v / num_chunks for k, v in aux.items()}
+                else:
+                    accumulated_grads_l1 = jax.tree_util.tree_map(
+                        lambda acc, g: acc + (g / num_chunks),
+                        accumulated_grads_l1,
+                        g_l1,
+                    )
+                    accumulated_grads_l3 = jax.tree_util.tree_map(
+                        lambda acc, g: acc + (g / num_chunks),
+                        accumulated_grads_l3,
+                        g_l3,
+                    )
+                    for k in total_aux:
+                        total_aux[k] += aux[k] / num_chunks
             else:
-                accumulated_grads = jax.tree_util.tree_map(
-                    lambda acc, g: acc + (g / num_chunks), accumulated_grads, grads
+                (loss_val, aux), grads = jax.value_and_grad(self.loss_fn, has_aux=True)(
+                    self.params, *batch_slice
                 )
-                for k in total_aux:
-                    total_aux[k] += aux[k] / num_chunks
+                if accumulated_grads is None:
+                    accumulated_grads = jax.tree_util.tree_map(
+                        lambda g: g / num_chunks, grads
+                    )
+                    total_aux = {k: v / num_chunks for k, v in aux.items()}
+                else:
+                    accumulated_grads = jax.tree_util.tree_map(
+                        lambda acc, g: acc + (g / num_chunks), accumulated_grads, grads
+                    )
+                    for k in total_aux:
+                        total_aux[k] += aux[k] / num_chunks
+
+        if self.adaptive_balancing_loss:
+            norm_l1 = jnp.sqrt(
+                sum(
+                    jnp.sum(jnp.square(g))
+                    for g in jax.tree_util.tree_leaves(accumulated_grads_l1)
+                )
+            )
+            norm_l3 = jnp.sqrt(
+                sum(
+                    jnp.sum(jnp.square(g))
+                    for g in jax.tree_util.tree_leaves(accumulated_grads_l3)
+                )
+            )
+            new_lambda = norm_l3 / (norm_l1 + 1e-8)
+            self.lambda_L1 = (
+                1.0 - self.lambda_smooth_alpha
+            ) * self.lambda_L1 + self.lambda_smooth_alpha * new_lambda
+            accumulated_grads = jax.tree_util.tree_map(
+                lambda g1, g3: self.lambda_L1 * g1 + g3,
+                accumulated_grads_l1,
+                accumulated_grads_l3,
+            )
+            total_aux["adaptive_lambda_L1"] = self.lambda_L1
 
         updates, self.opt_state = self.optimizer.update(
             accumulated_grads, self.opt_state
@@ -234,6 +310,24 @@ class PDE_solver:
             self.ema_params,
             self.params,
         )
+        if self.use_clip_gradient:
+            eps = 1e-6
+            global_grad_norm = jnp.sqrt(
+                sum(
+                    jnp.sum(jnp.square(g))
+                    for g in jax.tree_util.tree_leaves(accumulated_grads)
+                )
+            )
+            scale = jnp.minimum(1.0, self.clip_gradient / (global_grad_norm + eps))
+            post_clip_norm = global_grad_norm * scale
+            total_aux["grad_norm_global_clipped"] = post_clip_norm
+        global_grad_norm = jnp.sqrt(
+            sum(
+                jnp.sum(jnp.square(g))
+                for g in jax.tree_util.tree_leaves(accumulated_grads)
+            )
+        )
+        total_aux["grad_norm_global"] = global_grad_norm
 
         return total_aux
 
@@ -253,17 +347,15 @@ class PDE_solver:
         """
         x_flat = x.reshape(1, -1)
         y_flat = y.reshape(1, -1)
+        x_flat_norm, y_flat_norm = self._normalize_data(x_flat, y_flat)
         t = t.reshape(1, 1)
 
         def loss(xs, ys):
             return self.net.apply(params, t, xs, ys).squeeze()  # outputs log directly.
 
-        return jax.grad(loss)(x_flat, y_flat)
+        grad_norm = jax.grad(loss)(x_flat_norm, y_flat_norm)
 
-    @partial(jax.jit, static_argnums=0)
-    def grad_log_h(self, x: jax.Array, y: jax.Array, t: jax.Array) -> jax.Array:
-        """Compute `grad_log_h`."""
-        return self.grad_log_h_params(self.ema_params, x, y, t)
+        return grad_norm / self.x_std
 
     @partial(jax.jit, static_argnums=0)
     def grad_log_h_batched(self, x: jax.Array, y: jax.Array, t: jax.Array) -> jax.Array:
@@ -313,7 +405,11 @@ class PDE_solver:
                 for k in total_ema_aux:
                     total_ema_aux[k] += aux[k] / num_chunks
 
-        return {f"eval/{k}": float(v) for k, v in total_ema_aux.items()}
+        metrics = {f"eval/{k}": float(v) for k, v in total_ema_aux.items()}
+        for k, v in total_ema_aux.items():
+            if "loss" in k:
+                metrics[f"eval/log_{k}"] = float(jnp.log(v + 1e-6))
+        return metrics
 
     def save_params(self, ckpt_dir: str):
         """Save current params_list and opt_state_list to a checkpoint directory.
