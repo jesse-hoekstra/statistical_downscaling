@@ -405,10 +405,8 @@ class PDE_solver:
                 for k in total_ema_aux:
                     total_ema_aux[k] += aux[k] / num_chunks
 
-        metrics = {f"eval/{k}": float(v) for k, v in total_ema_aux.items()}
-        for k, v in total_ema_aux.items():
-            if "loss" in k:
-                metrics[f"eval/log_{k}"] = float(jnp.log(v + 1e-6))
+        metrics = {f"{k}": float(v) for k, v in total_ema_aux.items()}
+
         return metrics
 
     def save_params(self, ckpt_dir: str):
