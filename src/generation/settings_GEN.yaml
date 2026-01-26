@@ -65,7 +65,7 @@ pde_solver:
   lambda: 1 #to start with
   num_gen_samples: 128 # 128 8 is pde_solver on local machine 15360
   num_conditionings: 16 # 512 aka num_conditions 16 is pde_solver on local machine
-  chunk_size: 50
+  chunk_size: 100
   adaptive_balancing_loss: False
   lambda_smooth_alpha: 0.1
   normalize_data: True

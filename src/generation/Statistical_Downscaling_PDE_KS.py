@@ -148,11 +148,10 @@ class KSStatisticalDownscalingPDESolver(PDE_solver):
         inv_sigma_sq = 1 / self.x_std**2
 
         def _laplacian_exact(ts, xs, ys, inv_sigma_sq):
-            grad_f = jax.grad(f)
-
             def f(x):
                 return V_single(ts, x, ys)
 
+            grad_f = jax.grad(f)
             eye = jnp.eye(xs.shape[-1], dtype=xs.dtype)
 
             def diag_second(ei):
