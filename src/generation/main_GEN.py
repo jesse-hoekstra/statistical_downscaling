@@ -125,7 +125,7 @@ else:
 
 def _save_samples_h5(path, samples, *, y_bar=None, run_settings=None, rng_key=None):
     """Save only the samples to an HDF5 file as dataset 'samples'."""
-    arr = np.asarray(samples, dtype=np.float64)
+    arr = np.asarray(samples)
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with h5py.File(path, "w") as f:
         f.create_dataset("samples", data=arr)
@@ -147,7 +147,7 @@ def _build_C_prime(d: int, d_prime: int) -> jax.Array:
             [1 if j == downsampling_factor * i else 0 for j in range(d)]
             for i in range(d_prime)
         ]
-    ).astype(jnp.float32)
+    )
 
 
 def main():
@@ -368,7 +368,7 @@ def main():
             C_prime,
         )
         kld = calculate_kld_pooled(
-            samples, u_hfhr_samples, epsilon=float(run_sett_global["epsilon"])
+            samples, u_hfhr_samples, epsilon=float(run_sett_metrics["epsilon"])
         )
         sample_variability = calculate_sample_variability(samples)
         melr_weighted = calculate_melr_pooled(
@@ -376,7 +376,7 @@ def main():
             u_hfhr_samples,
             sample_shape=(run_sett_global["d"],),
             weighted=True,
-            epsilon=float(run_sett_global["epsilon"]),
+            epsilon=float(run_sett_metrics["epsilon"]),
         )
 
         melr_unweighted = calculate_melr_pooled(
@@ -384,7 +384,7 @@ def main():
             u_hfhr_samples,
             sample_shape=(run_sett_global["d"],),
             weighted=False,
-            epsilon=float(run_sett_global["epsilon"]),
+            epsilon=float(run_sett_metrics["epsilon"]),
         )
 
         wass1 = calculate_wass1_pooled(

@@ -40,7 +40,7 @@ class NewDriftSdeSampler(dfn_lib.SdeSampler):
     guidance_fn: Callable[[Array, Array, Array], Array] | None = flax.struct.field(
         default=None, pytree_node=False
     )
-    T: float = float(run_sett["general"]["T"])
+    T: float = float(run_sett["global"]["T"])
 
     def __post_init__(self):
         if self.guidance_fn is None:
@@ -92,9 +92,12 @@ class NewDriftSdeSampler(dfn_lib.SdeSampler):
                 x_for_guidance = x.squeeze(-1) if x.ndim == 3 else x
                 y_for_guidance = y.squeeze(-1) if y.ndim == 3 else y
                 grad_guidance = self.guidance_fn(
-                    x_for_guidance, y_for_guidance, self.T - t
+                    x_for_guidance,
+                    y_for_guidance,
+                    self.T - t,  # t runs from 1 to 0 so this is needed (T-s in notes)
                 )
                 dsquare_sigma_dt = dsquare_dt(self.scheme.sigma)(t)
+
                 drift -= s**2 * dsquare_sigma_dt * grad_guidance[..., None]
             else:
                 raise ValueError("Guidance function is not provided")

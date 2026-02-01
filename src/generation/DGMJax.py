@@ -119,10 +119,11 @@ class DGMNetJax(nn.Module):
         """
         dim = int(dim)
         half = dim // 2
-        n = n.astype(jnp.float32)
+        _fdtype = jnp.asarray(0.0).dtype
+        n = n.astype(_fdtype)
         freqs = jnp.exp(
-            -jnp.log(10000.0)
-            * jnp.arange(0, half, dtype=jnp.float32)
+            -jnp.log(jnp.asarray(10000.0, dtype=_fdtype))
+            * jnp.arange(0, half, dtype=_fdtype)
             / jnp.maximum(half, 1)
         )
         args = n[..., None] * freqs[None, ...]

@@ -22,7 +22,7 @@ def _build_C_prime(d: int, d_prime: int) -> jax.Array:
             [1 if j == downsampling_factor * i else 0 for j in range(d)]
             for i in range(d_prime)
         ]
-    ).astype(jnp.float32)
+    )
 
 
 class PDE_solver:
@@ -83,9 +83,9 @@ class PDE_solver:
         )
 
         # Initialize parameters with dummy batch
-        t0 = jnp.zeros((1, 1), dtype=jnp.float32)
-        x0 = jnp.zeros((1, self.d), dtype=jnp.float32)
-        y0 = jnp.zeros((1, self.d_prime), dtype=jnp.float32)
+        t0 = jnp.zeros((1, 1))
+        x0 = jnp.zeros((1, self.d))
+        y0 = jnp.zeros((1, self.d_prime))
         self.params = self.net.init(jax.random.PRNGKey(self.seed), t0, x0, y0)
 
         self.ema_params = jax.tree_util.tree_map(lambda x: x, self.params)

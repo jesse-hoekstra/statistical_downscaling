@@ -38,7 +38,7 @@ def _build_C_prime(d: int, d_prime: int) -> jax.Array:
             [1 if j == downsampling_factor * i else 0 for j in range(d)]
             for i in range(d_prime)
         ]
-    ).astype(jnp.float32)
+    )
 
 
 class KSStatisticalDownscalingPDESolver(PDE_solver):
@@ -70,7 +70,7 @@ class KSStatisticalDownscalingPDESolver(PDE_solver):
         self.C_prime = _build_C_prime(self.d, self.d_prime)
         self.scheme = scheme
         self.denoise_fn = denoise_fn
-        self.lambda_value = jnp.float32(self.run_sett_pde_solver["lambda"])
+        self.lambda_value = float(self.run_sett_pde_solver["lambda"])
         self.normalize_data = bool(self.run_sett_pde_solver["normalize_data"])
         if self.normalize_data:
             self.x_mean, self.x_std, self.y_mean, self.y_std = self._calibrate_data(

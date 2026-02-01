@@ -41,7 +41,7 @@ def calculate_constraint_rmse(
     C: jnp.ndarray,
 ) -> float:
     x = jnp.squeeze(predicted_samples, -1)
-    C = C.astype(jnp.float32)  # on external GPU
+    C = C.astype(x.dtype)
     Cx = jnp.einsum("ncd,od->nco", x, C)
     predicted_samples_red_dim = Cx[..., None]
     vec_c = jax.vmap(_single_calculate_constraint_rmse, in_axes=(1, 0), out_axes=0)(
