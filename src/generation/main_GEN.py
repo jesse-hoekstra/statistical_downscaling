@@ -293,7 +293,6 @@ def main():
         denoise_fn = restore_denoise_fn(
             f"{work_dir}/checkpoints_denoise_model", denoiser_model
         )
-        # Derive stable subkeys for different generation types
         key_uncond = jax.random.fold_in(SAMPLE_KEY_BASE, 0)
         key_wan = jax.random.fold_in(SAMPLE_KEY_BASE, 1)
         key_cond = jax.random.fold_in(SAMPLE_KEY_BASE, 2)

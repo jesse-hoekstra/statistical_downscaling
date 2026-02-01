@@ -34,7 +34,7 @@ def sample_unconditional(
         num_samples: Number of independent samples to draw.
         num_plots: Number of plots to generate.
     Returns:
-        Array of generated samples with shape `(num_samples, d, 1)`.
+        Array of generated samples with shape `(num_samples, num_plots, d, 1)`.
     """
     sampler = dfn_lib.SdeSampler(
         input_shape=(run_sett["global"]["d"], 1),
@@ -50,11 +50,15 @@ def sample_unconditional(
         apply_denoise_at_end=True,
         return_full_paths=False,
     )
-    generate = jax.jit(sampler.generate, static_argnames=("num_samples",))
-    keys = jax.random.split(rng_key, num_samples)
-    batched_generate = jax.vmap(lambda k: generate(rng=k, num_samples=num_plots))
+    keys = jax.random.split(rng_key, int(num_samples))
+    generate_one = jax.jit(lambda k: sampler.generate(rng=k, num_samples=num_plots))
 
-    return batched_generate(keys)
+    def loop_body(carry, key):
+        samples = generate_one(key)
+        return carry, samples
+
+    _, samples_all = jax.lax.scan(loop_body, init=None, xs=keys)
+    return samples_all
 
 
 def less_memory_sample_wan_guided(
@@ -73,7 +77,7 @@ def less_memory_sample_wan_guided(
 
     Returns `(num_samples, C, d, 1)` with `C=y_bar.shape[0]`.
     """
-    splits = 16
+    splits = int(run_sett["global"]["chunk_size_sampler"])
     total_conditions = int(y_bar.shape[0])
     if total_conditions % splits != 0:
         raise ValueError(
