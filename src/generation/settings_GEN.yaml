@@ -15,12 +15,12 @@ global:
   epsilon: 1e-5
   time_emb_dim: 16
 train_denoiser:
-  batch_size: 512 #32 for runthrough
-  total_train_steps: 50 #1_000_000  for runthrough
-  eval_every_steps: 10 #100 for runthrough
-  metric_aggregation_steps: 10 #100 for runthrough
-  save_interval_steps: 10 #100  for runthrough
-  num_batches_per_eval: 1 #10  for runthrough #not defined specifically in the paper
+  batch_size: 512 
+  total_train_steps: 1_000_000 
+  eval_every_steps: 100 
+  metric_aggregation_steps: 100 
+  save_interval_steps: 100 
+  num_batches_per_eval: 10 
   max_to_keep: 1
   beta_min: 0.1
   beta_max: 20 
@@ -57,18 +57,18 @@ pde_solver:
   x_high: 5.0
   y_low: -5.0
   y_high: 5.0
-  sampling_stages: 100_000 
+  sampling_stages: 75_000 
   type_lr_schedule: sirignano #set to specific value for fixed learning rate
   constant_lr: 1e-3
-  boundaries: [25_000, 50_000, 75_000]
-  lr_schedules: [1e-3, 5e-4, 1e-4, 5e-5]
+  boundaries: [25_000, 50_000]
+  lr_schedules: [1e-3, 5e-4, 1e-4]
   lambda: 1 #to start with
   num_gen_samples: 128 # 128 8 is pde_solver on local machine 15360
   num_conditionings: 16 # 512 aka num_conditions 16 is pde_solver on local machine
-  chunk_size: 50
+  chunk_size: 250
   adaptive_balancing_loss: False
   lambda_smooth_alpha: 0.1
-  normalize_data: True
+  normalize_data: False
 DGM:
   nodes_per_layer: 256
   num_layers: 5
@@ -81,7 +81,7 @@ easy_examples:
   n_samples_generate: 20_000
   dt: 0.0001
 wandb:
-  use_wandb: True
+  use_wandb: False
 metrics: 
   log_ema_metrics_every: 500
   log_train_metrics_every: 50

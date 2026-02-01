@@ -73,18 +73,37 @@ run_sett["global"]["work_dir"] = work_dir
 writer = None
 key_suffix = ""
 
-mode = str(run_sett["global"]["mode"])
-use_ema_eval = bool(run_sett["ema"]["use_ema_eval"])
-use_clip_gradient = bool(run_sett["optimizer"]["use_clip_gradient"])
-clip_gradient = float(run_sett["optimizer"]["clip_gradient"])
-adaptive_balancing_loss = bool(run_sett["pde_solver"]["adaptive_balancing_loss"])
-normalize_data = bool(run_sett["pde_solver"]["normalize_data"])
+run_sett_train_denoiser = run_sett["train_denoiser"]
+run_sett_pde_solver = run_sett["pde_solver"]
+run_sett_global = run_sett["global"]
+run_sett_metrics = run_sett["metrics"]
+run_sett_ema = run_sett["ema"]
+run_sett_optimizer = run_sett["optimizer"]
+
+mode = str(run_sett_global["mode"])
+use_ema_eval = bool(run_sett_ema["use_ema_eval"])
+use_clip_gradient = bool(run_sett_optimizer["use_clip_gradient"])
+clip_gradient = float(run_sett_optimizer["clip_gradient"])
+adaptive_balancing_loss = bool(run_sett_pde_solver["adaptive_balancing_loss"])
+normalize_data = bool(run_sett_pde_solver["normalize_data"])
+num_conditionings = int(run_sett_pde_solver["num_conditionings"])
+seed = int(run_sett_global["seed"])
+RNG_NAMESPACE = int(run_sett_global.get("RNG_NAMESPACE", 0))
+
+MASTER_KEY = jax.random.PRNGKey(seed)
+
+BASE = jax.random.fold_in(MASTER_KEY, int(RNG_NAMESPACE))
+DENOISER_KEY_BASE = jax.random.fold_in(BASE, 0)
+SAMPLE_KEY_BASE = jax.random.fold_in(BASE, 1)
+EVAL_KEY_BASE = jax.random.fold_in(BASE, 2)
+DATA_KEY_BASE = jax.random.fold_in(BASE, 3)
+PDE_KEY_BASE = jax.random.fold_in(BASE, 4)
 
 if use_wandb:
     base_writer = metric_writers.create_default_writer(work_dir, asynchronous=False)
 
     project = os.environ.get("WANDB_PROJECT", "generation")
-    entity = os.environ.get("WANDB_ENTITY")  # optional
+    entity = os.environ.get("WANDB_ENTITY")
     run_name = os.environ.get("WANDB_NAME", env_run_name)
     if gpu_tag_env and gpu_tag_env not in run_name:
         run_name = f"{run_name}_{gpu_tag_env}"
@@ -106,9 +125,7 @@ else:
 
 def _save_samples_h5(path, samples, *, y_bar=None, run_settings=None, rng_key=None):
     """Save only the samples to an HDF5 file as dataset 'samples'."""
-    arr = np.asarray(
-        samples, dtype=np.float64
-    )  # All the training was performed in single precision (fp32), while the generation of the data was performed in double precision (fp64).
+    arr = np.asarray(samples, dtype=np.float64)
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with h5py.File(path, "w") as f:
         f.create_dataset("samples", data=arr)
@@ -160,31 +177,22 @@ def main():
         raise ValueError(f"Invalid mode: {mode}")
 
     u_HFHR, u_LFLR, u_HFLR, x, t = get_raw_datasets(
-        file_name=run_sett["global"]["data_file_name"]
+        file_name=run_sett_global["data_file_name"]
     )
-    u_LFLR = u_LFLR[
-        :, :, ::2
-    ]  # they do this but don't explicitly mention it, note now we need a d_prime of 24
+    u_LFLR = u_LFLR[:, :, ::2]
 
-    u_hfhr_samples = u_HFHR.reshape(-1, int(run_sett["global"]["d"]), 1)
-    u_lflr_samples = u_LFLR.reshape(-1, int(run_sett["global"]["d_prime"]), 1)
+    u_hfhr_samples = u_HFHR.reshape(-1, int(run_sett_global["d"]), 1)
+    u_lflr_samples = u_LFLR.reshape(-1, int(run_sett_global["d_prime"]), 1)
     DATA_STD = u_hfhr_samples.std()
 
-    denoiser_model = create_denoiser_model()
-    diffusion_scheme = create_diffusion_scheme(DATA_STD)
-
-    run_sett_train_denoiser = run_sett["train_denoiser"]
-    run_sett_pde_solver = run_sett["pde_solver"]
-    run_sett_global = run_sett["global"]
-    run_sett_metrics = run_sett["metrics"]
-
-    num_conditionings = int(run_sett_pde_solver["num_conditionings"])
-    log_train_metrics_every = int(run_sett_metrics["log_train_metrics_every"])
-    log_ema_metrics_every = int(run_sett_metrics["log_ema_metrics_every"])
-    seed = int(run_sett_global["seed"])
-
     if mode == "train":
-        if run_sett["global"]["train_denoiser"]:
+        # Training should be in single precision
+        jax.config.update("jax_enable_x64", False)
+
+        denoiser_model = create_denoiser_model()
+        diffusion_scheme = create_diffusion_scheme(DATA_STD)
+
+        if run_sett_global["train_denoiser"]:
             batch_size = int(run_sett_train_denoiser["batch_size"])
             total_train_steps = int(run_sett_train_denoiser["total_train_steps"])
             metric_aggregation_steps = int(
@@ -198,12 +206,33 @@ def main():
             model = build_model(denoiser_model, diffusion_scheme, DATA_STD)
             trainer = build_trainer(model)
 
+            denoiser_key_train = jax.random.fold_in(DENOISER_KEY_BASE, 0)
+            denoiser_key_eval = jax.random.fold_in(DENOISER_KEY_BASE, 1)
+            denoiser_seed_train = int(
+                jax.random.randint(
+                    denoiser_key_train,
+                    shape=(),
+                    minval=0,
+                    maxval=2**31 - 1,
+                    dtype=jnp.int32,
+                )
+            )
+            denoiser_seed_eval = int(
+                jax.random.randint(
+                    denoiser_key_eval,
+                    shape=(),
+                    minval=0,
+                    maxval=2**31 - 1,
+                    dtype=jnp.int32,
+                )
+            )
+
             run_training(
                 train_dataloader=get_ks_dataset(
                     u_hfhr_samples,
                     split="train[:75%]",
                     batch_size=batch_size,
-                    seed=seed,
+                    seed=denoiser_seed_train,
                 ),
                 trainer=trainer,
                 workdir=work_dir,
@@ -214,14 +243,16 @@ def main():
                     u_hfhr_samples,
                     split="train[75%:]",
                     batch_size=batch_size,
-                    seed=seed,
+                    seed=denoiser_seed_eval,
                 ),
                 eval_every_steps=eval_every_steps,
                 num_batches_per_eval=num_batches_per_eval,
                 save_interval_steps=save_interval_steps,
                 max_to_keep=max_to_keep,
             )
-        if run_sett["global"]["train_pde"]:
+        if run_sett_global["train_pde"]:
+            log_train_metrics_every = int(run_sett_metrics["log_train_metrics_every"])
+            log_ema_metrics_every = int(run_sett_metrics["log_ema_metrics_every"])
             denoise_fn = restore_denoise_fn(
                 f"{work_dir}/checkpoints_denoise_model", denoiser_model
             )
@@ -230,12 +261,9 @@ def main():
                 settings=run_sett,
                 denoise_fn=denoise_fn,
                 scheme=diffusion_scheme,
-                rng_key=jax.random.PRNGKey(seed),
             )
-            key_master = jax.random.PRNGKey(seed)
-            RNG_NAMESPACE = run_sett_global["RNG_NAMESPACE"]
             for it in range(pde_solver.sampling_stages):
-                key_step = jax.random.fold_in(key_master, RNG_NAMESPACE + it)
+                key_step = jax.random.fold_in(PDE_KEY_BASE, it)
                 train_metrics = pde_solver.update_params(key_step)
                 global_step = int(pde_solver._step)
                 if use_wandb:
@@ -254,22 +282,27 @@ def main():
             pde_params_dir = os.path.join(work_dir, "checkpoints_pde_solver")
             pde_solver.save_params(pde_params_dir)
     elif mode == "sample":
+        # Sampling/generation should be in double precision
+        jax.config.update("jax_enable_x64", True)
+
         y = u_lflr_samples[:num_conditionings]
         generation_type = str(run_sett_global["generation_type"])
         num_gen_samples = int(run_sett_pde_solver["num_gen_samples"])
-
-        jax.config.update(
-            "jax_enable_x64", True
-        )  # while the generation of the data was performed in double precision (fp64)
+        denoiser_model = create_denoiser_model()
+        diffusion_scheme = create_diffusion_scheme(DATA_STD)
         denoise_fn = restore_denoise_fn(
             f"{work_dir}/checkpoints_denoise_model", denoiser_model
         )
+        # Derive stable subkeys for different generation types
+        key_uncond = jax.random.fold_in(SAMPLE_KEY_BASE, 0)
+        key_wan = jax.random.fold_in(SAMPLE_KEY_BASE, 1)
+        key_cond = jax.random.fold_in(SAMPLE_KEY_BASE, 2)
         sample_file = os.path.join(work_dir, f"samples_{generation_type}.h5")
         if generation_type == "unconditional":
             samples = sample_unconditional(
                 diffusion_scheme,
                 denoise_fn,
-                jax.random.PRNGKey(seed),
+                key_uncond,
                 num_samples=num_gen_samples,
                 num_plots=num_conditionings,
             )
@@ -283,7 +316,7 @@ def main():
                     diffusion_scheme,
                     denoise_fn,
                     y_bar=y,
-                    rng_key=jax.random.PRNGKey(seed),
+                    rng_key=key_wan,
                     num_samples=num_gen_samples,
                 )
             else:
@@ -291,19 +324,20 @@ def main():
                     diffusion_scheme,
                     denoise_fn,
                     y_bar=y,
-                    rng_key=jax.random.PRNGKey(seed),
+                    rng_key=key_wan,
                     num_samples=num_gen_samples,
                 )
             print(samples.std())
             print(samples.shape)
             _save_samples_h5(sample_file, samples)
         elif generation_type == "conditional":
+            denoiser_model = create_denoiser_model()
+            diffusion_scheme = create_diffusion_scheme(DATA_STD)
             pde_solver = KSStatisticalDownscalingPDESolver(
                 samples=u_hfhr_samples,
                 settings=run_sett,
                 denoise_fn=denoise_fn,
                 scheme=diffusion_scheme,
-                rng_key=jax.random.PRNGKey(seed),
             )
             pde_params_dir = os.path.join(work_dir, "checkpoints_pde_solver")
             pde_solver.load_params(pde_params_dir)
@@ -312,13 +346,14 @@ def main():
                 denoise_fn,
                 pde_solver,
                 y=y,
-                rng_key=jax.random.PRNGKey(seed),
+                rng_key=key_cond,
                 samples_per_condition=num_gen_samples,
             )
             print(samples.std())
             print(samples.shape)
             _save_samples_h5(sample_file, samples)
     elif mode == "eval":
+        # Evaluation/metrics in double precision
         jax.config.update("jax_enable_x64", True)
         C_prime = _build_C_prime(run_sett_global["d"], run_sett_global["d_prime"])
 
@@ -329,7 +364,7 @@ def main():
 
         constraint_rmse = calculate_constraint_rmse(
             samples,
-            u_lflr_samples[0 : int(run_sett_pde_solver["num_conditionings"])],
+            u_lflr_samples[0 : int(num_conditionings)],
             C_prime,
         )
         kld = calculate_kld_pooled(

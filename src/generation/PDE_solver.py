@@ -32,14 +32,13 @@ class PDE_solver:
     and gradient utilities. Subclasses must implement `loss_fn`.
     """
 
-    def __init__(self, settings: dict, rng_key: jax.Array | None = None):
+    def __init__(self, settings: dict):
         """Initialize solver configuration, model parameters, and optimizer.
 
         Args:
             settings: Dict with sections `general`, `pde_solver`, and `DGM`
                 specifying domain bounds, sampling sizes, optimizer
                 hyperparameters, and network architecture.
-            rng_key: Optional PRNG key for deterministic init and sampling.
         """
         # Common settings
         self.run_sett_pde_solver = settings["pde_solver"]

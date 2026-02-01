@@ -54,7 +54,6 @@ class KSStatisticalDownscalingPDESolver(PDE_solver):
         settings: dict,
         denoise_fn,
         scheme,
-        rng_key: jax.Array | None = None,
     ):
         """Initialize the statistical downscaling PDE solver.
 
@@ -66,9 +65,8 @@ class KSStatisticalDownscalingPDESolver(PDE_solver):
             denoise_fn: Callable denoiser used in drift construction.
             scheme: Diffusion scheme providing `sigma`, `scale`, and their
                 derivatives via autodiff.
-            rng_key: Optional PRNG key for deterministic initialization.
         """
-        super().__init__(settings=settings, rng_key=rng_key)
+        super().__init__(settings=settings)
         self.C_prime = _build_C_prime(self.d, self.d_prime)
         self.scheme = scheme
         self.denoise_fn = denoise_fn
