@@ -88,7 +88,7 @@ class NewDriftSdeSampler(dfn_lib.SdeSampler):
                         "Missing `y` in guidance_inputs; pass guidance_inputs={'y': <batch_y>} to `generate`."
                     )
                 y = guidance_inputs["y"]
-                # Flatten potential trailing singleton channel dims
+
                 x_for_guidance = x.squeeze(-1) if x.ndim == 3 else x
                 y_for_guidance = y.squeeze(-1) if y.ndim == 3 else y
                 grad_guidance = self.guidance_fn(
@@ -104,6 +104,4 @@ class NewDriftSdeSampler(dfn_lib.SdeSampler):
 
             return drift
 
-        # Return a new SdeDynamics object combining your new drift
-        # with the *original* diffusion function.
         return sde.SdeDynamics(drift=_new_drift, diffusion=original_dynamics.diffusion)
