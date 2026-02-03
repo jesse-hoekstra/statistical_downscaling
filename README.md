@@ -369,10 +369,4 @@ The project includes automated code formatting:
    chmod +x .git/hooks/pre-commit
    ```
 
-### Adding New Features
-
-#### Optimal Transport
-
-1. **Model Extensions**: Add new paramaterized and true models in `src/optimal_transport/alg1_OT.py` and `src/optimal_transport/dgp_OT.py`
-2. **Utilities**: Add helper functions in `src/optimal_transport/preprocessing_OT.py`
 
