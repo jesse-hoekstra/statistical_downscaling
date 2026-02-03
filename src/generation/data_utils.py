@@ -1,3 +1,12 @@
+"""Lightweight data-loading utilities for the KS experiments.
+
+This module provides:
+- get_raw_datasets: reads HF/LF/HR/LR arrays from an HDF5 file and
+  constructs a stride-based low-resolution view of the HF data.
+- get_ks_dataset: builds a deterministic, infinite tf.data pipeline that yields
+  batched samples with a reproducible circular shift augmentation.
+"""
+
 import h5py
 import jax.numpy as jnp
 import tensorflow as tf
@@ -5,24 +14,19 @@ from typing import Optional
 
 
 def get_raw_datasets(file_name, ds_x=4):
-    """Load KS trajectory datasets from an HDF5 file and derive a downsampled field.
-
-    This reads the low-fidelity, low-resolution (`LFLR`), high-fidelity, high-resolution (`HFHR`),
-    time (`t`), and space (`x`) arrays from the HDF5 file. It also constructs a
-    high-fidelity, low-resolution array (`HFLR`) by downsampling `HFHR` along the spatial axis
-    by a stride of `ds_x`.
+    """Load raw KS arrays and create a downsampled HF view.
 
     Args:
-        file_name: Path to an HDF5 file containing datasets 'LFLR', 'HFHR', 't', and 'x'.
-        ds_x: Positive integer stride used to downsample the spatial axis of `HFHR` to form `HFLR`.
+        file_name: Path to an HDF5 file with datasets 'LFLR', 'HFHR', 't', 'x'.
+        ds_x: Spatial stride used to subsample `HFHR` into `HFLR` via `::ds_x`.
 
     Returns:
-        Tuple `(u_HFHR, u_LFLR, u_HFLR, x, t)` where each element is a NumPy array.
-        `u_HFLR` is computed as `u_HFHR[:, :, ::ds_x]`.
-
-    Raises:
-        FileNotFoundError: If the HDF5 file cannot be found.
-        KeyError: If required datasets are missing from the file.
+        A tuple `(u_HFHR, u_LFLR, u_HFLR, x, t)` where:
+        - u_HFHR: High-fidelity, high-resolution array.
+        - u_LFLR: Low-fidelity, low-resolution array (from file).
+        - u_HFLR: Subsampled view of HFHR along the spatial axis: `HFHR[:, :, ::ds_x]`.
+        - x: Spatial grid.
+        - t: Temporal grid.
     """
     with h5py.File(file_name, "r+") as f1:
         u_LFLR = f1["LFLR"][()]
@@ -37,34 +41,22 @@ def get_raw_datasets(file_name, ds_x=4):
 def get_ks_dataset(
     u_samples: jnp.ndarray, split: str, batch_size: int, seed: Optional[int] = None
 ):
-    """Create a seeded random, infinite, batched NumPy iterator of KS samples.
+    """Create a deterministic, infinite NumPy iterator of batched KS samples.
 
-    The pipeline:
-    - casts `u_samples` to float32,
-    - optionally subsets via `split`,
-    - repeats indefinitely,
-    - applies a deterministic circular shift to each element using stateless RNG
-      keyed by `(seed, sample_index % len(u_samples))`,
-    - batches and prefetches, returning a NumPy iterator of dicts {'x': array}.
+    Each element is circularly shifted by a reproducible, per-index offset to
+    encourage translation robustness during training.
 
     Args:
-        u_samples: Array-like of shape (N, L, 1) containing KS fields. Cast to float32.
-        split: 'train', 'train[:p%]' to take a prefix, or 'train[p%:]' to take a suffix.
-        batch_size: Number of examples per batch.
-        seed: Base RNG seed for stateless, per-sample circular shifts. Must be provided
-            to ensure reproducible augmentation.
+        u_samples: Array of shape (N, L, 1) containing KS fields.
+        split: One of
+            - "train": use full set;
+            - "train[:p%]": take prefix p percent;
+            - "train[p%:]": take suffix from p percent onward.
+        batch_size: Number of samples per batch.
+        seed: Base RNG seed for stateless, per-sample circular shifts.
 
     Returns:
-        An endless NumPy iterator yielding dictionaries with key 'x' and value of
-        shape (batch_size, L, 1).
-
-    Determinism:
-        Given the same `u_samples`, `split`, `batch_size`, and `seed`, the iterator
-        yields identical batches across runs. Each element receives a distinct shift
-        drawn uniformly from [0, L), fixed by its index.
-
-    Raises:
-        ValueError: If `split` is not one of the supported formats.
+        A NumPy iterator yielding dicts with key 'x' of shape (batch_size, L, 1).
     """
     ds = tf.data.Dataset.from_tensor_slices({"x": u_samples.astype(jnp.float32)})
     total_len = len(u_samples)
@@ -80,10 +72,13 @@ def get_ks_dataset(
     else:
         raise ValueError(f"Unsupported split string: {split}")
 
+    # Ensure deterministic ordering and repeats.
     options = tf.data.Options()
     options.experimental_deterministic = True
     ds = ds.with_options(options)
     ds = ds.repeat()
+
+    # Enumerate to derive a stable per-sample index used as RNG key suffix.
     global_seed = tf.cast(int(seed), tf.int32)
     ds = ds.enumerate()
 
@@ -92,6 +87,7 @@ def get_ks_dataset(
         sample_len = tf.shape(sample)[0]
         idx_mod = tf.math.floormod(index, tf.cast(total_len, tf.int64))
         idx_mod_i32 = tf.cast(idx_mod, tf.int32)
+        # Stateless uniform shift in [0, L) keyed by (seed, sample_idx).
         shift = tf.random.stateless_uniform(
             shape=[],
             minval=0,
