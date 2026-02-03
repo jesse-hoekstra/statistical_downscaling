@@ -160,27 +160,33 @@ wandb:
 The project uses `settings_GEN.yaml` for configuration:
 
 ```yaml
-output_dir: 'src/generation/output/'
-option: 'unconditional'
-rng_key: 888
-epsilon: 1e-10
-general:
+global:
+  seed: 888
+  RNG_NAMESPACE: 20260115
+  mode: 'sample'                    # 'train' | 'sample' | 'eval'
+  generation_type: 'conditional'    # 'unconditional' | 'wan_conditional' | 'conditional'
+  train_denoiser: False
+  train_pde: True
   data_file_name: 'data/ks_trajectories_512.h5'
-  d: 192 #3 for easy example 
-  d_prime: 24  #48?
-  batch_size: 512 #32 for runthrough
-  total_train_steps: 50 #1_000_000  for runthrough
-  eval_every_steps: 10 #100 for runthrough
-  metric_aggregation_steps: 10 #100 for runthrough
-  save_interval_steps: 10 #100  for runthrough
-  num_batches_per_eval: 1 #10  for runthrough #not defined specifically in the paper
-  max_to_keep: 1
+  d: 192
+  d_prime: 24
   T: 1
+  output_dir: 'src/generation/output/'
+  chunk_size_sampler: 16
+  hyperparameter_tuning: True
+train_denoiser:
+  batch_size: 512
+  total_train_steps: 1_000_000
+  eval_every_steps: 100
+  metric_aggregation_steps: 100
+  save_interval_steps: 100
+  num_batches_per_eval: 10
+  max_to_keep: 1
   beta_min: 0.1
-  beta_max: 20 
+  beta_max: 20
   norm_guide_strength: 1.0
   ema_decay: 0.95
-  clip_min: 1e-3 
+  clip_min: 1e-3
 UNET:
   out_channels: 1
   num_channels: 32,64,128
@@ -198,30 +204,43 @@ optimizer:
   decay_steps: 990_000
   end_value: 1e-6
   clip_norm: 1.0
+  clip_gradient: 200_000.0
+  use_clip_gradient: False
 exp_tspan:
   num_steps: 256
-  end_sigma: 1e-2 #not defined specifically in the paper
+  end_sigma: 1e-2
 pde_solver:
   t_low: 1e-10
-  nSim_interior: 1000 #Batch size
-  nSim_terminal: 1000 #Batch size
-  x_low: 0.0 
-  x_high: 64.0
-  sampling_stages: 3_000 #100_000 
-  steps_per_sample: 1 #can remove this it seems 
-  learning_rate: sirignano #set to specific value for fixed learning rate
-  boundaries: [5000, 10000, 20000, 30000, 40000, 45000]
-  lambda: 1 #to start with
-  num_gen_samples: 15360 # 128 8 is pde_solver on local machine 15360
-  num_models: 512 # 512 aka num_conditions 16 is pde_solver on local machine
+  nSim_interior: 1000
+  nSim_terminal: 1000
+  x_low: -5.0
+  x_high: 5.0
+  y_low: -5.0
+  y_high: 5.0
+  sampling_stages: 75_000
+  type_lr_schedule: sirignano
+  constant_lr: 1e-3
+  boundaries: [25_000, 50_000]
+  lr_schedules: [1e-3, 5e-4, 1e-4]
+  lambda: 1
+  num_gen_samples: 128
+  num_conditionings: 512
+  chunk_size: 250
+  adaptive_balancing_loss: False
+  lambda_smooth_alpha: 0.1
+  normalize_data: False
 DGM:
-  nodes_per_layer: 50
-  num_layers: 3
-  N_epochs: 1_250
-easy_examples:
-  n_samples_train: 38_400
-  n_samples_generate: 20_000
-  dt: 0.0001
+  nodes_per_layer: 256
+  num_layers: 5
+ema:
+  ema_decay: 0.999
+  use_ema_eval: True
+wandb:
+  use_wandb: False
+metrics:
+  log_ema_metrics_every: 500
+  log_train_metrics_every: 50
+  epsilon: 1e-5
 ```
 
 ## Usage
@@ -230,7 +249,7 @@ easy_examples:
 
 #### Optimal Transport
 
-Run the main optimization:
+Run the main script:
 
 ```bash
 python main_OT.py
@@ -238,11 +257,40 @@ python main_OT.py
 
 #### Generation
 
-Run the main optimization:
+Run the main script:
 
 ```bash
 python main_GEN.py
 ```
+
+Common workflows:
+- Train denoiser only:
+  1) In `src/generation/settings_GEN.yaml`: set `global.mode: 'train'`, `global.train_denoiser: True`, `global.train_pde: False`.
+  2) Run:
+     ```bash
+     python src/generation/main_GEN.py --config src/generation/settings_GEN.yaml
+     ```
+- Train PDE solver (requires a denoiser checkpoint in the same `work_dir`):
+  1) Set `global.mode: 'train'`, `global.train_denoiser: False`, `global.train_pde: True`.
+     - Alternatively, set both True to first train the denoiser then the PDE solver in one run.
+  2) Run the same command as above.
+- Sample/generate:
+  1) Set `global.mode: 'sample'` and choose `global.generation_type`:
+     - `unconditional`: draws from the learned prior.
+     - `wan_conditional`: LinearConstraint guidance using the denoiser; optionally enable `global.hyperparameter_tuning` to sweep `norm_guide_strength` and `exp_tspan.num_steps`.
+     - `conditional`: PDE-guided sampling using the learned guidance function; requires PDE checkpoints.
+  2) Run:
+     ```bash
+     python src/generation/main_GEN.py --config src/generation/settings_GEN.yaml
+     ```
+  3) Samples are saved to `main_GEN/<run_name>/samples_<generation_type>.h5`.
+- Evaluate metrics on saved samples:
+  1) Set `global.mode: 'eval'` and keep `global.generation_type` consistent with the saved sample file.
+  2) Run:
+     ```bash
+     python src/generation/main_GEN.py --config src/generation/settings_GEN.yaml
+     ```
+  3) Prints and (optionally) logs: constraint RMSE, KLD, sample variability, MELR (weighted/unweighted), and 1-Wasserstein.
 
 ### Custom Configuration
 
@@ -280,14 +328,23 @@ Modify the `settings_X.yaml` files to experiment with different parameters:
 
 ### Generation
 
-#### `src/generation/settings_GEN.yaml`
-- Configuration for unconditional generation experiments: dataset paths, UNet and optimizer hyperparameters, PDE solver and DGM settings, and evaluation/logging cadence.
-
-#### `src/generation/wandb_adapter.py`
-- `WandbWriter` adapter mirroring `clu.metric_writers` to Weights & Biases for unified metric logging.
-
-#### `src/generation/plotting_utils.py`
-- Plotting helper to render Kuramoto–Sivashinsky spacetime grids (e.g., `plot_320_samples_KS`) and save figures to the configured output directory.
+- `src/generation/main_GEN.py`: Entry point. Reads `--config`, constructs a per-run `work_dir` under `main_GEN/`, sets up optional W&B logging, and executes one of:
+  - `mode: 'train'` → trains denoiser (`train_denoiser=True`) and/or PDE solver (`train_pde=True`).
+  - `mode: 'sample'` → runs `generation_type` in {'unconditional','wan_conditional','conditional'} and writes `samples_<generation_type>.h5`.
+  - `mode: 'eval'` → computes metrics from `utils_metrics.py` on saved samples.
+- `src/generation/denoiser_utils.py`: Builds the UNet denoiser, VP diffusion scheme, trainer, and restores an EMA `denoise_fn` from Orbax checkpoints.
+- `src/generation/sampler_utils.py`: Sampling helpers:
+  - `sample_unconditional`,
+  - `sample_wan_guided` (LinearConstraint guidance),
+  - `sample_pde_guided` (PDE-driven guidance via `NewDriftSdeSampler`).
+- `src/generation/Statistical_Downscaling_PDE_KS.py`: KS-specific solver that learns a value function to provide gradients of `log h(t,x,y)` for conditional guidance.
+- `src/generation/PDE_solver.py`: Base solver (DGM network, training loop, EMA, checkpointing, gradient utilities).
+- `src/generation/utils_metrics.py`: Metrics (constraint RMSE, KLD, MELR weighted/unweighted, 1-Wasserstein, sample variability).
+- `src/generation/data_utils.py`: Loads HF/LF KS datasets from HDF5 and builds deterministic training/eval pipelines.
+- `wandb_integration/wandb_adapter.py`: `WandbWriter` adapter that mirrors `clu.metric_writers` to Weights & Biases. Enable via `wandb.use_wandb: True`. You can also set:
+  - `WANDB_PROJECT`, `WANDB_ENTITY`, `WANDB_NAME` (optional),
+  - `WANDB_DISABLED=1` to force-disable,
+  - `GPU_TAG` to suffix the run name for device tagging.
 
 ## Development
 
