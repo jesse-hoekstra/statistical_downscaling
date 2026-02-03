@@ -1,4 +1,4 @@
-# Statistical Downscaling Project
+# Statistical Downscaling for Time-Series
 
 A Python implementation of statistical downscaling. This project is divided in conditional generation and optimal transport. 
 
