@@ -40,7 +40,6 @@ class PDE_solver:
                 specifying domain bounds, sampling sizes, optimizer
                 hyperparameters, and network architecture.
         """
-        # Common settings
         self.run_sett_pde_solver = settings["pde_solver"]
         self.run_sett_global = settings["global"]
         self.run_sett_dgm = settings["DGM"]
@@ -70,7 +69,6 @@ class PDE_solver:
         self.num_conditionings = int(self.run_sett_pde_solver["num_conditionings"])
         self.chunk_size = int(self.run_sett_pde_solver["chunk_size"])
 
-        # DGM network
         hidden = int(self.run_sett_dgm["nodes_per_layer"])
         n_layers = int(self.run_sett_dgm["num_layers"])
         self.net = DGMNetJax(
@@ -81,16 +79,12 @@ class PDE_solver:
             C_prime=self.C_prime,
             final_trans=None,
         )
-
-        # Initialize parameters with dummy batch
         t0 = jnp.zeros((1, 1))
         x0 = jnp.zeros((1, self.d))
         y0 = jnp.zeros((1, self.d_prime))
         self.params = self.net.init(jax.random.PRNGKey(self.seed), t0, x0, y0)
-
         self.ema_params = jax.tree_util.tree_map(lambda x: x, self.params)
 
-        # Optimizer
         self.learning_rate = self._build_lr_schedule()
         self.clip_gradient = float(self.run_sett_optimizer["clip_gradient"])
         self.use_clip_gradient = bool(self.run_sett_optimizer["use_clip_gradient"])
@@ -114,7 +108,7 @@ class PDE_solver:
         self.lambda_L1 = 1.0
 
     def _build_lr_schedule(self):
-        """Create learning-rate schedule (constant or cosine with warmup/decay)."""
+        """Create learning-rate schedule (constant or piecewise constant)."""
         boundaries = self.run_sett_pde_solver["boundaries"]
         constant_lr = float(self.run_sett_pde_solver["constant_lr"])
         lr_schedules = self.run_sett_pde_solver["lr_schedules"]
@@ -210,14 +204,24 @@ class PDE_solver:
         return self.loss_fn(params, *batch_slice)[1]["L3_loss"]
 
     def _train_step(self, key):
-        """Train the network using SGD/Adam over sampled batches.
+        """Perform one optimizer update over a freshly sampled training batch.
 
-        Iterates for `sampling_stages`, drawing fresh samples each stage and
-        performing `steps_per_sample` optimization steps per model.
+        This method:
+        - draws a training batch via `self.sampler(key)`;
+        - splits the batch into `chunk_size` pieces to bound memory;
+        - computes gradients either for the full loss or, when
+          `self.adaptive_balancing_loss` is enabled, separately for L1 and L3 and
+          combines them with a smoothed, data-driven λ;
+        - averages auxiliary metrics across chunks;
+        - applies an optimizer step and updates EMA parameters;
+        - optionally records global gradient norms with/without clipping.
 
         Args:
-            log_fn: Optional callable receiving a dict of scalar metrics once
-                per sampling stage.
+            key: JAX PRNG key used by the sampler to generate the training batch.
+
+        Returns:
+            Dict[str, jax.Array]: Aggregated scalar metrics for logging (e.g.,
+            losses and gradient norms).
         """
         batch = self.sampler(key)
         chunk_size = int(self.chunk_size)
@@ -340,9 +344,9 @@ class PDE_solver:
     def grad_log_h_params(
         self, params: jax.Array, x: jax.Array, y: jax.Array, t: jax.Array
     ) -> jax.Array:
-        """Compute per-sample gradients ∂/∂x log h(t, x) for given params.
+        """Compute per-sample gradients ∂/∂x log h(t, x, y) for given params.
 
-        Returns an array matching the flattened spatial dimension of `x`.
+        Returns an array matching the flattened spatial dimension of `x` and `y`.
         """
         x_flat = x.reshape(1, -1)
         y_flat = y.reshape(1, -1)
