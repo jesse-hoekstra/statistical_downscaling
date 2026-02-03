@@ -121,7 +121,7 @@ def restore_denoise_fn(checkpoint_dir: str, denoiser_model):
 def build_model(denoiser_model, diffusion_scheme, data_std: float):
     """Wrap the denoiser into a `DenoisingModel` with sampling/weighting.
 
-    The input shape is `(d, 1)` where `d` is read from `run_sett['general']['d']`.
+    The input shape is `(d, 1)` where `d` is read from `run_sett['global']['d']`.
     Time sampling uses `time_uniform_sampling` over the diffusion scheme and
     noise weighting uses EDM weighting parameterized by `data_std`.
 
