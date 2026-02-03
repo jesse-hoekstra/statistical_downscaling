@@ -47,19 +47,19 @@ class LinearConstraint:
 
      This class implements the precise constrained sampling method from Wan et al.
      (2023), following the formula:
-       D̃ = (C')†y' + (I - VVᵀ)[D(x_t,σ_t) - α * ∇_{x_t}||C'D(x_t,σ_t) - y'||²]
+       D̃ = (C')†y' + (I - VVᵀ)[D(x̂_t,σ_t) - α * ∇_{x̂_t}||C'D(x̂_t,σ_t) - y'||²]
      where α is the guidance strength.
 
      The process involves first correcting the denoiser's output with a gradient
      step and then projecting the result onto the constraint manifold.
 
     Attributes:
-       c_prime: The constraint matrix `C'` itself.
+       C_prime: The constraint matrix `C'` itself.
        y_bar: The observation vector `y'`.
        v_matrix: The pre-computed `V` matrix from the SVD of `C'`.
        v_transpose: The pre-computed `Vᵀ` matrix from the SVD of `C'`.
        pseudo_inverse_C_prime: The pre-computed pseudo-inverse `(C')†`.
-       guide_strength: The rescaled guidance strength `α'`.
+       guide_strength: The rescaled guidance strength `α`.
     """
 
     C_prime: Array
@@ -107,16 +107,36 @@ class LinearConstraint:
     def __call__(
         self, denoise_fn: DenoiseFn, guidance_inputs: ArrayMapping | None = None
     ) -> DenoiseFn:
-        """Constructs the guided denoiser function."""
+        """Constructs and returns a guided denoiser with the same interface as `denoise_fn`.
+
+        Behavior:
+        - Builds a closure that, when called, applies the linear-constraint guidance as explained before.
+        - The returned function can be used transparently by samplers in place of
+          the original `denoise_fn`.
+
+        Expected shapes:
+        - x̂: Array with leading batch dimension. In this project it is typically
+          shape (num_conditions, d, 1), where d is the high-resolution spatial size.
+        - sigma: Scalar Array or an Array broadcastable to the batch; the same σ is
+          used for all items in the batch during a single call.
+        - cond: Optional mapping of conditioning tensors; must be broadcastable to
+          the same leading batch size as x̂.
+        - y_bar (stored in `self`): shape (num_conditions, d'), one per item in the batch.
+
+        Returns:
+        - A callable `_guided_denoise(x, sigma, cond)` that outputs an Array with
+          the same shape as `x`, i.e., (num_conditions, d, 1).
+        """
 
         def _guided_denoise(
             x: Array, sigma: Array, cond: ArrayMapping | None = None
         ) -> Array:
-            """Applies gradient correction then projection."""
+            """Applies the modification as explained in Wan et al. (2023)."""
             original_shape = x.shape
 
             # Compute per-sample gradients directly (no loss returned), with batched y_bar
             def sample_loss(xi: Array, yi: Array) -> Array:
+                """Computes the loss for a single sample."""
                 den_sample = denoise_fn(xi[None, ...], sigma, cond)[0]
                 den_flat = den_sample.reshape(-1)
                 y_flat = yi.reshape(-1)
@@ -128,22 +148,17 @@ class LinearConstraint:
             denoised_uncons = denoise_fn(x, sigma, cond)
             denoised_flat = denoised_uncons.reshape(x.shape[0], -1)
 
-            # 2. Compute the term inside the brackets: D - α' * ∇
             corrected_denoised_flat = (
                 denoised_flat
                 - self.guide_strength * grads_per_sample.reshape(x.shape[0], -1)
             )
 
-            # 3. Apply the projection to the corrected term.
-            # This computes (I - VVᵀ) * [corrected_denoised_flat]
             v_t_dot_corr = jnp.einsum(
                 "ij,bj->bi", self.v_transpose, corrected_denoised_flat
             )
             projection = jnp.einsum("ij,bj->bi", self.v_matrix, v_t_dot_corr)
             projected_term = corrected_denoised_flat - projection
 
-            # 4. Add the constraint-satisfying component: (C')†y' + projected_term
-            # Batched constraint component: (C')† y_bar for each sample
             y_bar_flat = self.y_bar.reshape(x.shape[0], -1)
             constraint_comp = jnp.einsum(
                 "ij,bj->bi", self.pseudo_inverse_C_prime, y_bar_flat
