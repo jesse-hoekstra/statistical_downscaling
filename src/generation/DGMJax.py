@@ -1,4 +1,4 @@
-"""Deep Galerkin Network (DGM) components implemented in JAX.
+"""Deep Galerkin Method (DGM) components implemented in JAX.
 
 Provides a recurrent DGM block (`LSTMLayerJax`), an affine layer with optional
 nonlinearity (`DenseLayerJax`), and a full network (`DGMNetJax`) that stacks
@@ -12,7 +12,7 @@ from typing import Optional
 
 
 class LSTMLayerJax(nn.Module):
-    """Recurrent block used in Deep Galerkin Networks (DGM).
+    """Recurrent block used in Deep Galerkin Method (DGM).
 
     Implements gated updates resembling LSTM to evolve a hidden state given
     the current concatenated input [t, x].
@@ -86,7 +86,7 @@ class DenseLayerJax(nn.Module):
 
 
 class DGMNetJax(nn.Module):
-    """Deep Galerkin Network (DGM) implemented with Flax.
+    """Deep Galerkin Method (DGM) implemented with Flax.
 
     Stacks an initial dense layer, multiple recurrent DGM blocks, and a final
     projection to produce a scalar PDE solution estimate.
@@ -134,11 +134,11 @@ class DGMNetJax(nn.Module):
 
     @nn.compact
     def __call__(self, t: jax.Array, x: jax.Array, y: jax.Array) -> jax.Array:
-        """Forward pass of a Deep Galerkin Network (DGM) in JAX/Flax.
+        """Forward pass of a Deep Galerkin Network (DGM) in JAX/Flax. With added sinusoidal time embedding and gated connections.
 
         Args:
             t: Time inputs `(B, 1)`.
-            x: Spatial inputs `(B, d + d_prime)`.
+            x: Spatial inputs `(B, d)`.
             y: Target inputs `(B, d_prime)`.
         Returns:
             Scalar output `(B, 1)` implementing an approximation to the PDE solution.
