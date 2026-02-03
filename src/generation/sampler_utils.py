@@ -1,3 +1,12 @@
+"""Sampling helpers for unconditional and conditional generation.
+
+This module provides thin wrappers around Swirl-Dynamics samplers to:
+- build the linear observation matrix C' for downsampling,
+- draw unconditional samples,
+- draw WAN-style conditionally guided samples via a post-processed denoiser,
+- draw PDE-guided samples using a learned log h guidance function (NewDriftSdeSampler).
+"""
+
 import jax
 import jax.numpy as jnp
 from swirl_dynamics.lib import diffusion as dfn_lib
@@ -8,6 +17,19 @@ from src.generation.swirl_dynamics_new_sampler.samplers import NewDriftSdeSample
 
 
 def _build_C_prime(d: int, d_prime: int) -> jax.Array:
+    """Construct a stride-based downsampling operator C'.
+
+    The operator maps a high-resolution vector of length `d` to a low-resolution
+    vector of length `d_prime` by picking every `downsampling_factor = d // d_prime`
+    entry. This matches the way LR observations are constructed in the dataset.
+
+    Args:
+        d: High-resolution spatial length.
+        d_prime: Low-resolution length.
+
+    Returns:
+        Array of shape `(d_prime, d)` representing C'.
+    """
     downsampling_factor = d // d_prime
 
     return jnp.array(
@@ -26,7 +48,7 @@ def sample_unconditional(
     num_plots: int,
     run_sett,
 ):
-    """Generate unconditional samples using an SDE sampler.
+    """Generate unconditional samples using an SDE sampler. num_plots is equal to the number of conditions in the conditional samplers.
 
     Args:
         diffusion_scheme: Diffusion schedule object.
@@ -34,6 +56,7 @@ def sample_unconditional(
         rng_key: JAX PRNG key for sampling.
         num_samples: Number of independent samples to draw.
         num_plots: Number of plots to generate, equal to the number of conditions in the conditional samplers.
+        run_sett: Settings dictionary.
     Returns:
         Array of generated samples with shape `(num_samples, num_plots, d, 1)`.
     """
@@ -70,7 +93,24 @@ def sample_wan_guided(
     num_samples: int,
     run_sett,
 ):
-    """ """
+    """Generate WAN-style conditionally guided samples.
+
+    Applies the LinearConstraint post-processing transform to the denoiser to
+    enforce C' x ≈ y' during sampling. Guidance strength is read from
+    `run_sett["train_denoiser"]["norm_guide_strength"]`.
+
+    Args:
+        diffusion_scheme: Diffusion schedule object.
+        denoise_fn: Callable denoiser inference function.
+        y_bar: Conditioning LR observations with shape `(num_conditions, d_prime, 1)`
+          or `(num_conditions, d_prime)`.
+        rng_key: JAX PRNG key.
+        num_samples: How many independent draws per condition.
+        run_sett: Settings dictionary.
+
+    Returns:
+        Array with shape `(num_samples, num_conditions, d, 1)`.
+    """
 
     C_prime = _build_C_prime(
         int(run_sett["global"]["d"]), run_sett["global"]["d_prime"]
@@ -117,7 +157,22 @@ def sample_pde_guided(
     samples_per_condition: int,
     y: jnp.ndarray,
 ):
-    """ """
+    """Generate samples guided by a learned PDE-based guidance function.
+
+    Uses `NewDriftSdeSampler` with `guidance_fn=pde_solver.grad_log_h_batched`,
+    which supplies per-condition gradients of log h(t, x, y) to guide the SDE.
+
+    Args:
+        diffusion_scheme: Diffusion schedule object.
+        denoise_fn: Callable denoiser inference function.
+        pde_solver: Instance exposing `grad_log_h_batched` and run settings.
+        rng_key: JAX PRNG key.
+        samples_per_condition: Number of independent draws for each condition.
+        y: Conditioning LR observations of shape `(num_conditions, d_prime[, 1])`.
+
+    Returns:
+        Array with shape `(samples_per_condition, num_conditions, d, 1)`.
+    """
     num_conditionings = int(pde_solver.num_conditionings)
     if y.shape[0] != num_conditionings:
         raise ValueError(
