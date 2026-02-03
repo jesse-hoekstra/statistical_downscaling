@@ -117,15 +117,15 @@ class LinearConstraint:
         Expected shapes:
         - x̂: Array with leading batch dimension. In this project it is typically
           shape (num_conditions, d, 1), where d is the high-resolution spatial size.
-        - sigma: Scalar Array or an Array broadcastable to the batch; the same σ is
-          used for all items in the batch during a single call.
+        - sigma: Scalar Array or an Array broadcastable to the same leading size as x̂; the same σ is
+          used for all conditions during a single call.
         - cond: Optional mapping of conditioning tensors; must be broadcastable to
-          the same leading batch size as x̂.
-        - y_bar (stored in `self`): shape (num_conditions, d'), one per item in the batch.
+          the same leading size as x̂.
+        - y_bar (stored in `self`): shape (num_conditions, d'), one per condition.
 
         Returns:
-        - A callable `_guided_denoise(x, sigma, cond)` that outputs an Array with
-          the same shape as `x`, i.e., (num_conditions, d, 1).
+        - A callable `_guided_denoise(x̂, σ, cond)` that outputs an Array with
+          the same shape as `x̂`, i.e., (num_conditions, d, 1).
         """
 
         def _guided_denoise(
