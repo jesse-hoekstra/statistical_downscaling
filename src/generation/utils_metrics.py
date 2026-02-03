@@ -1,4 +1,12 @@
-"""Metric utilities for constraint RMSE, variability, KLD, and MELR."""
+"""Metrics used to evaluate generated KS samples against reference data.
+
+Provided metrics (pooled over samples/conditions where applicable):
+- constraint RMSE: relative error of C x vs. y' per condition, averaged.
+- sample variability: sqrt(mean pixel-wise variance) across generated samples.
+- KLD (sum over dimensions) via KDE on a fixed grid.
+- MELR: mismatch of log energy spectra (weighted or unweighted).
+- 1-Wasserstein (per-dimension, histogram-based) averaged over dimensions.
+"""
 
 import jax.numpy as jnp
 from jax.scipy.stats import gaussian_kde
@@ -18,14 +26,14 @@ with open(args.config, "r") as f:
 def _single_calculate_constraint_rmse(
     predicted_samples: jnp.ndarray, condition_reference_samples: jnp.ndarray
 ) -> float:
-    """Calculate relative RMSE between predicted and reference samples as defined in the supplementary material (note the choice of the denominator).
-
-    Computes per-sample L2 error divided by the predicted sample L2 norm,
-    then averages over the batch.
+    """Relative RMSE for one condition.
 
     Args:
-        predicted_samples: Array of predicted samples shaped (N, ...).
-        condition_reference_samples: Array of reference samples shaped (N, ...).
+        predicted_samples: Array `(d, 1)` or `(d,)` predicted at LR after C.
+        condition_reference_samples: Array `(d, 1)` or `(d,)` reference y'.
+
+    Returns:
+        Scalar relative RMSE: ||p - r||_2 / ||p||_2 (0 if ||p||_2 == 0).
     """
 
     diff_norm = jnp.linalg.norm(predicted_samples - condition_reference_samples, axis=1)
@@ -40,6 +48,18 @@ def calculate_constraint_rmse(
     condition_reference_samples: jnp.ndarray,
     C: jnp.ndarray,
 ) -> float:
+    """Compute constraint RMSE pooled over conditions.
+
+    Applies C to predicted HF samples and compares to provided LR conditions.
+
+    Args:
+        predicted_samples: Array `(N, C, d, 1)` of HF predictions.
+        condition_reference_samples: Array `(C, d', 1)` of LR y' per condition.
+        C: Observation matrix with shape `(d', d)`.
+
+    Returns:
+        Scalar RMSE averaged over conditions.
+    """
     x = jnp.squeeze(predicted_samples, -1)
     C = C.astype(x.dtype)
     Cx = jnp.einsum("ncd,od->nco", x, C)
@@ -51,45 +71,16 @@ def calculate_constraint_rmse(
 
 
 def _single_calculate_sample_variability(generated_samples: jnp.ndarray) -> float:
-    """
-    Calculates the sample variability for a set of generated conditional samples.
-
-    This metric is defined in "Debias Coarsely, Sample Conditionally: Statistical
-    Downscaling through Optimal Transport and Probabilistic Diffusion Models"
-    (Supplementary Material, Appendix C, Eq. 36). It is described as the
-    mean pixel-wise standard deviation in the generated conditional samples for a
-    given condition.
-
-    The formula is:
-    Var = sqrt( (1 / (N * d)) * sum_{n=1 to N} sum_{m=1 to d} (u_nm - u_mean_m)^2 )
-
-    Where:
-    - N is the number of samples for a given condition.
-    - d is the number of dimensions (pixels) in each sample.
-    - u_nm is the value of the m-th dimension of the n-th sample.
-    - u_mean_m is the mean value of the m-th dimension across all N samples.
-
-    This can be simplified to the root mean square of the pixel-wise standard
-    deviations.
+    """Compute variability for one condition by aggregating across samples.
 
     Args:
-        generated_samples (jnp.ndarray): A 2D numpy array of shape (N, d),
-            where N is the number of samples and d is the number of features
-            or pixels for each sample. All samples should be generated from the
-            same condition.
+        generated_samples: Array `(N, d, 1)` for a fixed condition.
 
     Returns:
-        float: The calculated sample variability, a single non-negative value.
+        Scalar sqrt(mean variance) across spatial positions.
     """
-    # Calculate the variance for each pixel/dimension across all samples.
-    # The `axis=0` argument computes the variance along the "N" dimension.
-    # jnp.var uses N in the denominator by default (ddof=0), which matches the formula.
     pixel_wise_variances = jnp.var(generated_samples, axis=0)
-
-    # Calculate the mean of these variances.
     mean_variance = jnp.mean(pixel_wise_variances)
-
-    # The sample variability is the square root of the mean variance.
     sample_variability = jnp.sqrt(mean_variance)
 
     return sample_variability
@@ -97,6 +88,14 @@ def _single_calculate_sample_variability(generated_samples: jnp.ndarray) -> floa
 
 @jax.jit
 def calculate_sample_variability(generated_samples: jnp.ndarray) -> float:
+    """Average sample variability across conditions.
+
+    Args:
+        generated_samples: Array `(N, C, d, 1)`.
+
+    Returns:
+        Scalar mean of variability over conditions.
+    """
     vec_c = jax.vmap(_single_calculate_sample_variability, in_axes=(1,), out_axes=0)(
         generated_samples
     )
@@ -108,33 +107,34 @@ def _single_dimension_calculate_kld(
     reference_samples: jnp.ndarray,
     epsilon: float = 1e-10,
 ) -> float:
-    """
-    Calculates the Kullback-Leibler divergence for a single dimension.
+    """KL divergence for one spatial dimension using KDE and trapezoidal rule.
+
+    Args:
+        predicted_samples: Array `(N, 1)` for one dimension.
+        reference_samples: Array `(M, 1)` for one dimension.
+        epsilon: Small positive value to avoid division by zero.
+
+    Returns:
+        Scalar KLD D_KL(ref || pred) on a common grid.
     """
 
-    # Extract the 1D marginal data for the current dimension
     pred_data = jnp.squeeze(predicted_samples)
     ref_data = jnp.squeeze(reference_samples)
 
-    # Create Kernel Density Estimations for both distributions
     kde_pred = gaussian_kde(pred_data, bw_method="scott")
     kde_ref = gaussian_kde(ref_data, bw_method="scott")
 
-    # Create a common grid of points to evaluate the PDFs
     min_val = jnp.minimum(jnp.min(pred_data), jnp.min(ref_data))
     max_val = jnp.maximum(jnp.max(pred_data), jnp.max(ref_data))
     max_val = jnp.where(max_val == min_val, min_val + 1e-6, max_val)
     grid = jnp.linspace(min_val, max_val, 256)
 
-    # Evaluate the PDFs on the grid
     pdf_pred = kde_pred(grid)
     pdf_ref = kde_ref(grid)
 
-    # Calculate the integrand for KL divergence without boolean indexing
     mask = pdf_ref > epsilon
     integrand = jnp.where(mask, pdf_ref * jnp.log(pdf_ref / (pdf_pred + epsilon)), 0.0)
 
-    # Approximate the integral using the trapezoidal rule over full grid
     kld_m = trapezoid(integrand, x=grid)
 
     return kld_m
@@ -146,34 +146,15 @@ def _single_calculate_kld(
     reference_samples: jnp.ndarray,
     epsilon: float = 1e-10,
 ) -> float:
-    """
-    Calculates the aggregated Kullback-Leibler divergence using Kernel Density Estimation.
-
-    This metric is defined in "Debias Coarsely, Sample Conditionally: Statistical
-    Downscaling through Optimal Transport and Probabilistic Diffusion Models"
-    (Supplementary Material, Appendix C, Eq. 35). It computes the KL divergence
-    for the 1D marginal distributions of each dimension and sums them up.
-
-    The formula is:
-    KLD = sum_{m=1 to d} integral( p_m_ref(v) * log(p_m_ref(v) / p_m_pred(v)) dv )
-
-    Where:
-    - d is the number of dimensions (pixels).
-    - p_m_ref and p_m_pred are the 1D marginal probability density functions
-      (PDFs) for the m-th dimension, estimated using KDE with Scott's rule
-      for bandwidth selection.
-    - The integral is approximated using the trapezoidal rule.
+    """Sum of 1D KLD over spatial dimensions for a single pool of samples.
 
     Args:
-        predicted_samples (np.ndarray): A 2D numpy array of shape (N, d),
-            representing the generated samples.
-        reference_samples (np.ndarray): A 2D numpy array of shape (M, d),
-            representing the ground truth or reference samples HFHR. N can be different from M.
-        epsilon (float): A small value to add to the predicted PDF to avoid
-            division by zero in the log.
+        predicted_samples: Array `(N, d, 1)`.
+        reference_samples: Array `(M, d, 1)`.
+        epsilon: Stability constant.
 
     Returns:
-        float: The total KLD over all dimensions.
+        Scalar sum of per-dimension KLD.
     """
     if predicted_samples.shape[1] != reference_samples.shape[1]:
         raise ValueError(
@@ -194,6 +175,18 @@ def calculate_kld_pooled(
     reference_samples: jnp.ndarray,
     epsilon: float = 1e-10,
 ) -> float:
+    """KLD pooled across samples and conditions.
+
+    Pools the (N, C) axes of predictions into a single batch and computes KLD.
+
+    Args:
+        predicted_samples: `(N, C, d, 1)`.
+        reference_samples: `(M, d, 1)`.
+        epsilon: Stability constant.
+
+    Returns:
+        Scalar KLD (sum over dimensions).
+    """
     num_pooled_samples = predicted_samples.shape[0] * predicted_samples.shape[1]
     num_dimensions = predicted_samples.shape[2]
     pooled_predicted_samples = jnp.reshape(
@@ -206,7 +199,7 @@ def calculate_kld_pooled(
 
 @partial(jax.jit, static_argnames="sample_shape")
 def _get_k_grids(sample_shape: tuple):
-    """Creates JAX-compatible wavenumber grids for a given static shape."""
+    """Build FFT frequency grids and radial histogram bins for MELR."""
     freqs = [jnp.fft.fftfreq(n, d=1.0 / n) for n in sample_shape]
     k_grids = jnp.meshgrid(*freqs, indexing="ij")
     k_magnitude = jnp.sqrt(sum(k**2 for k in k_grids))
@@ -225,7 +218,7 @@ def _get_energy_spectrum_for_one_sample(
     k_magnitude: jnp.ndarray,
     k_bins: jnp.ndarray,
 ) -> jnp.ndarray:
-    """Helper function to compute the energy spectrum for a single flattened sample."""
+    """Compute binned radial energy spectrum for a single sample."""
     sample_reshaped = sample.reshape(sample_shape)
 
     fft_coeffs = jnp.fft.fftn(sample_reshaped)
@@ -246,8 +239,17 @@ def calculate_melr_pooled(
     weighted: bool,
     epsilon: float = 1e-10,
 ) -> jnp.ndarray:
-    """
-    Calculates average MELR by vmapping over the C-axis (conditions).
+    """Mean energy log-ratio discrepancy (weighted or unweighted) pooled.
+
+    Args:
+        predicted_samples: `(N, C, d, 1)` or `(N, d, 1)`.
+        reference_samples: `(M, d, 1)`.
+        sample_shape: Spatial shape, e.g., `(d,)` for 1D.
+        weighted: If True, weight by normalized reference spectrum.
+        epsilon: Stability constant for log-ratio.
+
+    Returns:
+        Scalar MELR value.
     """
     if predicted_samples.ndim == 3:
         predicted_samples = predicted_samples[:, None, :, :]
@@ -294,42 +296,29 @@ def _single_dimension_calculate_wass1(
     reference_samples_1d: jnp.ndarray,
     num_bins: int = 1000,
 ) -> float:
-    """
-    Calculates the Wasserstein-1 metric for a single dimension using empirical CDFs.
-
-    The integral is approximated over the fixed range [-20, 20] as specified.
-    """
-    # Define the integration range and bins
+    """1D Wasserstein-1 on a fixed histogram grid for one dimension."""
     integration_range = [
         -20.0,
         20.0,
-    ]  # this can be changed to the range of the data!!! I think also sufficient for KS
+    ]
     bins = jnp.linspace(integration_range[0], integration_range[1], num_bins + 1)
 
-    # Ensure data is 1D for histogram
     pred_data = jnp.squeeze(predicted_samples_1d)
     ref_data = jnp.squeeze(reference_samples_1d)
 
-    # Compute histograms (empirical PDFs)
     counts_pred, _ = jnp.histogram(pred_data, bins=bins, range=integration_range)
     counts_ref, _ = jnp.histogram(ref_data, bins=bins, range=integration_range)
 
-    # Compute empirical CDFs. Add epsilon for numerical stability if sum is zero.
     total_pred = jnp.sum(counts_pred)
     total_ref = jnp.sum(counts_ref)
 
     cdf_pred = jnp.cumsum(counts_pred) / (total_pred + 1e-10)
     cdf_ref = jnp.cumsum(counts_ref) / (total_ref + 1e-10)
 
-    # Calculate the absolute difference between CDFs
     cdf_diff = jnp.abs(cdf_pred - cdf_ref)
 
-    # Get bin centers for trapezoidal integration
-    # The CDF values correspond to the probability mass *within* each bin
     bin_centers = (bins[:-1] + bins[1:]) / 2.0
 
-    # Approximate the integral using the trapezoidal rule
-    # This is equivalent to sum(|CDF_pred - CDF_ref| * dz)
     wass1_m = trapezoid(cdf_diff, x=bin_centers)
 
     return wass1_m
@@ -341,26 +330,7 @@ def _single_calculate_wass1(
     reference_samples: jnp.ndarray,
     num_bins: int = 1000,
 ) -> float:
-    """
-    Calculates the aggregated Wasserstein-1 metric (Wass1) as defined in Eq. 38.
-
-    It computes the Wass1 metric for the 1D marginal distributions of each
-    dimension and averages them.
-
-    The formula is:
-    Wass1 = (1/d) * sum_{m=1 to d} integral( |CDF_pred,m(z) - CDF_ref,m(z)| dz )
-
-    Args:
-        predicted_samples (jnp.ndarray): Array of shape (N, d, 1),
-            representing the generated samples.
-        reference_samples (jnp.ndarray): Array of shape (M, d, 1),
-            representing the reference samples. N can be different from M.
-        num_bins (int): The number of bins to use for the empirical CDF
-            and integration. Must be static for JIT.
-
-    Returns:
-        float: The mean Wass1 metric over all dimensions.
-    """
+    """Average per-dimension 1-Wasserstein distance for a single pool."""
     if predicted_samples.shape[1] != reference_samples.shape[1]:
         raise ValueError(
             "Predicted and reference samples must have the same number of dimensions (columns)."
@@ -389,19 +359,7 @@ def calculate_wass1_pooled(
     reference_samples: jnp.ndarray,
     num_bins: int = 1000,
 ) -> float:
-    """
-    JIT-compiled entry point for pooled Wass1 calculation.
-
-    Pools the batch and condition axes of predicted_samples before metric calculation.
-
-    Args:
-        predicted_samples (jnp.ndarray): Shape (N, C, D, 1)
-        reference_samples (jnp.ndarray): Shape (M, D, 1)
-        num_bins (int): Number of bins for histogram.
-
-    Returns:
-        float: The mean Wass1 metric.
-    """
+    """Wasserstein-1 pooled across samples and conditions (mean over dims)."""
     # Pool the N (batch) and C (condition) axes
     num_pooled_samples = predicted_samples.shape[0] * predicted_samples.shape[1]
     num_dimensions = predicted_samples.shape[2]
