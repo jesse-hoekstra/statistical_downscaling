@@ -31,10 +31,10 @@ from src.generation.utils_metrics import (
 from src.generation.data_utils import get_raw_datasets, get_ks_dataset
 from src.generation.sampler_utils import (
     sample_unconditional,
-    less_memory_sample_wan_guided,
     sample_pde_guided,
     sample_wan_guided,
 )
+from src.generation.hyperparameter_utils import hyperparameter_step
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--config", type=str, default="src/generation/settings_GEN.yaml")
@@ -79,6 +79,7 @@ run_sett_global = run_sett["global"]
 run_sett_metrics = run_sett["metrics"]
 run_sett_ema = run_sett["ema"]
 run_sett_optimizer = run_sett["optimizer"]
+run_sett_exp_tspan = run_sett["exp_tspan"]
 
 mode = str(run_sett_global["mode"])
 use_ema_eval = bool(run_sett_ema["use_ema_eval"])
@@ -285,11 +286,14 @@ def main():
         # Sampling/generation should be in double precision
         jax.config.update("jax_enable_x64", True)
 
-        y = u_lflr_samples[:num_conditionings]
-        generation_type = str(run_sett_global["generation_type"])
-        num_gen_samples = int(run_sett_pde_solver["num_gen_samples"])
         denoiser_model = create_denoiser_model()
         diffusion_scheme = create_diffusion_scheme(DATA_STD)
+
+        generation_type = str(run_sett_global["generation_type"])
+        num_gen_samples = int(run_sett_pde_solver["num_gen_samples"])
+        hyperparameter_tuning = bool(run_sett_global["hyperparameter_tuning"])
+
+        y = u_lflr_samples[:num_conditionings]
         denoise_fn = restore_denoise_fn(
             f"{work_dir}/checkpoints_denoise_model", denoiser_model
         )
@@ -304,34 +308,68 @@ def main():
                 key_uncond,
                 num_samples=num_gen_samples,
                 num_plots=num_conditionings,
+                run_sett=run_sett,
             )
             print(jnp.mean(samples))
             print(samples.std())
             _save_samples_h5(sample_file, samples)
         elif generation_type == "wan_conditional":
-
-            if num_conditionings % 16 != 0:
+            if hyperparameter_tuning:
+                alphas = [0.125, 0.25, 0.5, 1.0, 1.25, 1.5, 1.75, 2.0]
+                steps_N = [32, 64, 128, 256, 512, 1024]
+                melr_results = jnp.zeros((len(alphas), len(steps_N)))
+                variability_results = jnp.zeros((len(alphas), len(steps_N)))
+                for i, a_tilde in enumerate(alphas):
+                    for j, n_steps in enumerate(steps_N):
+                        run_sett["train_denoiser"]["norm_guide_strength"] = float(
+                            a_tilde
+                        )
+                        run_sett["exp_tspan"]["num_steps"] = int(n_steps)
+                        key_ij = jax.random.fold_in(jax.random.fold_in(key_wan, i), j)
+                        melr_unw_val, sam_var_val = hyperparameter_step(
+                            run_sett,
+                            diffusion_scheme,
+                            denoise_fn,
+                            y,
+                            key_ij,
+                            u_hfhr_samples,
+                        )
+                        melr_results = melr_results.at[i, j].set(melr_unw_val)
+                        variability_results = variability_results.at[i, j].set(
+                            sam_var_val
+                        )
+                        print(
+                            f"Alpha: {a_tilde}, Steps: {n_steps}, MELR: {melr_unw_val}, Variability: {sam_var_val}"
+                        )
+                if use_wandb and writer is not None:
+                    series_labels = [f"alpha={a}" for a in alphas]
+                    writer.write_line_series(
+                        "hp_tuning_MELR_unweighted/lines",
+                        steps_N,
+                        melr_results,
+                        series_labels=series_labels,
+                        title="MELR (unweighted) vs Steps",
+                    )
+                    writer.write_line_series(
+                        "hp_tuning_Sample_Variability/lines",
+                        steps_N,
+                        variability_results,
+                        series_labels=series_labels,
+                        title="Sample Variability vs Steps",
+                    )
+            else:
                 samples = sample_wan_guided(
                     diffusion_scheme,
                     denoise_fn,
                     y_bar=y,
                     rng_key=key_wan,
                     num_samples=num_gen_samples,
+                    run_sett=run_sett,
                 )
-            else:
-                samples = less_memory_sample_wan_guided(
-                    diffusion_scheme,
-                    denoise_fn,
-                    y_bar=y,
-                    rng_key=key_wan,
-                    num_samples=num_gen_samples,
-                )
-            print(samples.std())
-            print(samples.shape)
-            _save_samples_h5(sample_file, samples)
+                print(samples.std())
+                print(samples.shape)
+                _save_samples_h5(sample_file, samples)
         elif generation_type == "conditional":
-            denoiser_model = create_denoiser_model()
-            diffusion_scheme = create_diffusion_scheme(DATA_STD)
             pde_solver = KSStatisticalDownscalingPDESolver(
                 samples=u_hfhr_samples,
                 settings=run_sett,

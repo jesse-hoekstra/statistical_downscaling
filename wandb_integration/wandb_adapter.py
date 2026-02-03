@@ -164,3 +164,47 @@ class WandbWriter:
         if hasattr(self.base_writer, "close"):
             self.base_writer.close()
         wandb.finish()
+
+    def write_line_series(
+        self,
+        tag,
+        x_values,
+        y_values,
+        series_labels,
+        title=None,
+        x_label="Step",
+        y_label="Value",
+    ):
+        """
+        Logs a multi-line plot to Weights & Biases.
+
+        Args:
+            tag (str): The key used in the W&B dashboard (e.g., "tuning/results").
+            x_values (list or np.array): Shared X-axis values for all lines.
+            y_values (list of lists or np.array): Y-axis values. Shape should be (num_lines, num_x_points).
+            series_labels (list of str): Names for each line (legend keys).
+            title (str): The title of the chart.
+        """
+
+        # 1. Sanitize Data: Convert numpy arrays to standard Python lists
+        # W&B serialization handles standard lists more reliably for custom plots
+        if hasattr(x_values, "tolist"):
+            x_values = x_values.tolist()
+
+        if hasattr(y_values, "tolist"):
+            y_values = y_values.tolist()
+
+        # 2. Validation (Optional but helpful)
+        if len(y_values) != len(series_labels):
+            print(
+                f"Warning: Number of Y-series ({len(y_values)}) does not match labels ({len(series_labels)})"
+            )
+
+        # 3. Create the Custom Chart
+        # xs can be a single list (shared x-axis) or a list of lists (unique x-axis per line)
+        line_series_plot = wandb.plot.line_series(
+            xs=x_values, ys=y_values, keys=series_labels, title=title, xname=x_label
+        )
+
+        # 4. Log to W&B
+        wandb.log({tag: line_series_plot})

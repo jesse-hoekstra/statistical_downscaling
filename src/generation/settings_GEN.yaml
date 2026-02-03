@@ -12,6 +12,8 @@ global:
   T: 1
   output_dir: 'src/generation/output/'
   time_emb_dim: 16
+  chunk_size_sampler: 16
+  hyperparameter_tuning: True
 train_denoiser:
   batch_size: 512 
   total_train_steps: 1_000_000 
