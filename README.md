@@ -328,20 +328,25 @@ Modify the `settings_X.yaml` files to experiment with different parameters:
 
 ### Generation
 
-- `src/generation/main_GEN.py`: Entry point. Reads `--config`, constructs a per-run `work_dir` under `main_GEN/`, sets up optional W&B logging, and executes one of:
+#### `src/generation/main_GEN.py`
+- Entry point. Reads `--config`, constructs a per-run `work_dir` under `main_GEN/`, sets up optional W&B logging, and executes one of:
   - `mode: 'train'` → trains denoiser (`train_denoiser=True`) and/or PDE solver (`train_pde=True`).
   - `mode: 'sample'` → runs `generation_type` in {'unconditional','wan_conditional','conditional'} and writes `samples_<generation_type>.h5`.
   - `mode: 'eval'` → computes metrics from `utils_metrics.py` on saved samples.
-- `src/generation/denoiser_utils.py`: Builds the UNet denoiser, VP diffusion scheme, trainer, and restores an EMA `denoise_fn` from Orbax checkpoints.
-- `src/generation/sampler_utils.py`: Sampling helpers:
+#### `src/generation/denoiser_utils.py`
+- Builds the UNet denoiser, VP diffusion scheme, trainer, and restores an EMA `denoise_fn` from Orbax checkpoints.
+####  `src/generation/sampler_utils.py`
+- Sampling helpers:
   - `sample_unconditional`,
   - `sample_wan_guided` (LinearConstraint guidance),
   - `sample_pde_guided` (PDE-driven guidance via `NewDriftSdeSampler`).
-- `src/generation/Statistical_Downscaling_PDE_KS.py`: KS-specific solver that learns a value function to provide gradients of `log h(t,x,y)` for conditional guidance.
-- `src/generation/PDE_solver.py`: Base solver (DGM network, training loop, EMA, checkpointing, gradient utilities).
-- `src/generation/utils_metrics.py`: Metrics (constraint RMSE, KLD, MELR weighted/unweighted, 1-Wasserstein, sample variability).
-- `src/generation/data_utils.py`: Loads HF/LF KS datasets from HDF5 and builds deterministic training/eval pipelines.
-- `wandb_integration/wandb_adapter.py`: `WandbWriter` adapter that mirrors `clu.metric_writers` to Weights & Biases. Enable via `wandb.use_wandb: True`. You can also set:
+#### `src/generation/Statistical_Downscaling_PDE_KS.py`
+- KS-specific solver that learns a value function to provide gradients of `log h(t,x,y)` for conditional guidance.
+#### `src/generation/PDE_solver.py`: Base solver (DGM network, training loop, EMA, checkpointing, gradient utilities).
+#### `src/generation/utils_metrics.py`: Metrics (constraint RMSE, KLD, MELR weighted/unweighted, 1-Wasserstein, sample variability).
+####  `src/generation/data_utils.py`: Loads HF/LF KS datasets from HDF5 and builds deterministic training/eval pipelines.
+####  `wandb_integration/wandb_adapter.py`
+- `WandbWriter` adapter that mirrors `clu.metric_writers` to Weights & Biases. Enable via `wandb.use_wandb: True`. You can also set:
   - `WANDB_PROJECT`, `WANDB_ENTITY`, `WANDB_NAME` (optional),
   - `WANDB_DISABLED=1` to force-disable,
   - `GPU_TAG` to suffix the run name for device tagging.
