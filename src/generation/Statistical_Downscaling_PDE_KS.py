@@ -1,9 +1,12 @@
-"""KS statistical downscaling PDE built on a DGM and diffusion schedule.
+"""PDE-based statistical downscaling for the 1D Kuramoto–Sivashinsky setting.
 
-Defines the PDE residual and terminal losses used for conditional sampling with
-linear observations Cx = y. The solver uses a Deep Galerkin Network (DGM) for
-V(t, x) and derives drift/diffusion terms from a provided diffusion scheme and
-denoiser.
+This module defines a solver that learns a value function V(t, x, y) as an approximation to the solution of the PDE  used to
+derive guidance for conditional diffusion sampling with linear observations
+ C' x = y'. The solver implements:
+- construction of the observation matrix C' (mask),
+- optional per-dimension normalization from training samples,
+- a loss composed of a PDE interior residual (L1) and a terminal loss (L3),
+- utilities to compute gradients of log h(t, x, y) for sampler guidance.
 """
 
 import jax
@@ -42,10 +45,12 @@ def _build_C_prime(d: int, d_prime: int) -> jax.Array:
 
 
 class KSStatisticalDownscalingPDESolver(PDE_solver):
-    """PDE for statistical downscaling with linear observation Cx = y.
+    """PDE solver specialized for KS downscaling with linear observations.
 
-    Implements interior-residual and terminal losses using a DGM for V(t, x)
-    and drift/diffusion terms derived from a diffusion scheme and denoiser.
+    The class ties together a diffusion scheme, a denoiser (for drift terms),
+    and a Deep Galerkin Network (from the base PDE_solver) to optimize a value
+    function that enforces both a PDE residual in the interior and a terminal
+    constraint consistent with C' x = y'.
     """
 
     def __init__(
@@ -55,16 +60,15 @@ class KSStatisticalDownscalingPDESolver(PDE_solver):
         denoise_fn,
         scheme,
     ):
-        """Initialize the statistical downscaling PDE solver.
+        """Initialize the solver and optional normalization statistics.
 
         Args:
-            samples: Training samples (may be used by downstream utilities).
-            y_bar: Conditioning observations at low resolution; shape `(M, d')`
-                or `(d',)`.
-            settings: Hierarchical settings dictionary for base solver and DGM.
-            denoise_fn: Callable denoiser used in drift construction.
+            samples: Training HF samples of shape (N, d, 1). Used only to
+                estimate normalization statistics when `normalize_data=True`.
+            settings: Nested configuration passed to the base solver.
+            denoise_fn: Callable denoiser used to build SDE drift terms.
             scheme: Diffusion scheme providing `sigma`, `scale`, and their
-                derivatives via autodiff.
+                derivatives through autodiff.
         """
         super().__init__(settings=settings)
         self.C_prime = _build_C_prime(self.d, self.d_prime)
@@ -83,6 +87,7 @@ class KSStatisticalDownscalingPDESolver(PDE_solver):
             self.y_std = jnp.ones(self.d_prime)
 
     def _calibrate_data(self, samples):
+        """Compute per-dimension mean/std for x and induced y = C' x."""
         x_mean = jnp.mean(samples.squeeze(-1), axis=0)
         x_std = jnp.std(samples.squeeze(-1), axis=0) + 1e-6
 
@@ -92,9 +97,11 @@ class KSStatisticalDownscalingPDESolver(PDE_solver):
         return x_mean, x_std, y_mean, y_std
 
     def _normalize_data(self, x, y):
+        """Apply stored normalization to x and y."""
         return (x - self.x_mean) / self.x_std, (y - self.y_mean) / self.y_std
 
     def _denormalize_data(self, x_norm, y_norm):
+        """Invert normalization for x and y."""
         return x_norm * self.x_std + self.x_mean, y_norm * self.y_std + self.y_mean
 
     @partial(jax.jit, static_argnums=0)
@@ -115,7 +122,7 @@ class KSStatisticalDownscalingPDESolver(PDE_solver):
             t_interior: Interior times `(B, 1)`.
             x_interior: Interior states `(B, d)`.
             y_interior: Interior targets `(B, d)`.
-            t_terminal: Terminal times `(B, 1)` (typically all T).
+            t_terminal: Terminal times `(B, 1)` .
             x_terminal: Terminal states `(B, d)`.
             y_terminal: Terminal targets `(B, d)`.
 
