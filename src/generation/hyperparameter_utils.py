@@ -38,9 +38,9 @@ def hyperparameter_step(
     samples = sample_wan_guided(
         diffusion_scheme,
         denoise_fn,
-        y_bar=y[:5],
+        y_bar=y[:50],
         rng_key=key_wan,
-        num_samples=10,
+        num_samples=50,
         run_sett=run_sett,
     )
 

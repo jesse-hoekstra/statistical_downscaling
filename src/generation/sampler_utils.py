@@ -111,16 +111,23 @@ def sample_wan_guided(
     Returns:
         Array with shape `(num_samples, num_conditions, d, 1)`.
     """
-
+    downsampling_factor = run_sett["global"]["d"] // run_sett["global"]["d_prime"]
     C_prime = _build_C_prime(
         int(run_sett["global"]["d"]), run_sett["global"]["d_prime"]
     )
 
-    guidance_transform = LinearConstraint.create(
-        C_prime=C_prime,
-        y_bar=y_bar,
-        norm_guide_strength=run_sett["train_denoiser"]["norm_guide_strength"],
-    )
+    if False:  # Use the LinearConstraint guidance transform, own code
+        guidance_transform = LinearConstraint.create(
+            C_prime=C_prime,
+            y_bar=y_bar,
+            norm_guide_strength=run_sett["train_denoiser"]["norm_guide_strength"],
+        )
+    else:  # Use the InfillFromSlices guidance transform, swirl_dynamics code
+        guidance_transform = dfn_lib.InfillFromSlices(
+            slices=(slice(None), slice(None, None, downsampling_factor), slice(None)),
+            guide_strength=run_sett["train_denoiser"]["norm_guide_strength"],
+        )
+
     sampler = dfn_lib.SdeSampler(
         input_shape=(run_sett["global"]["d"], 1),
         integrator=solver_lib.EulerMaruyama(),
@@ -137,8 +144,11 @@ def sample_wan_guided(
     )
 
     keys = jax.random.split(rng_key, num_samples)
+    guidance_inputs = {"observed_slices": y_bar}
     generate_one = jax.jit(
-        lambda k: sampler.generate(rng=k, num_samples=int(y_bar.shape[0]))
+        lambda k: sampler.generate(
+            rng=k, guidance_inputs=guidance_inputs, num_samples=int(y_bar.shape[0])
+        )
     )
 
     def loop_body(carry, key):

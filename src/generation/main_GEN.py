@@ -315,11 +315,11 @@ def main():
             _save_samples_h5(sample_file, samples)
         elif generation_type == "wan_conditional":
             if hyperparameter_tuning:
-                alphas = [0.125, 0.25, 0.5, 1.0, 1.25, 1.5, 1.75, 2.0]
+                alpha_tildes = [0.125, 0.25, 0.5, 1.0, 1.25, 1.5, 1.75, 2.0]
                 steps_N = [32, 64, 128, 256, 512, 1024]
-                melr_results = jnp.zeros((len(alphas), len(steps_N)))
-                variability_results = jnp.zeros((len(alphas), len(steps_N)))
-                for i, a_tilde in enumerate(alphas):
+                melr_results = jnp.zeros((len(alpha_tildes), len(steps_N)))
+                variability_results = jnp.zeros((len(alpha_tildes), len(steps_N)))
+                for i, a_tilde in enumerate(alpha_tildes):
                     for j, n_steps in enumerate(steps_N):
                         run_sett["train_denoiser"]["norm_guide_strength"] = float(
                             a_tilde
@@ -339,10 +339,12 @@ def main():
                             sam_var_val
                         )
                         print(
-                            f"Alpha: {a_tilde}, Steps: {n_steps}, MELR: {melr_unw_val}, Variability: {sam_var_val}"
+                            f"Alpha tilde: {a_tilde}, Steps: {n_steps}, unweighted MELR: {melr_unw_val}, Variability: {sam_var_val}"
                         )
                 if use_wandb and writer is not None:
-                    series_labels = [f"alpha={a}" for a in alphas]
+                    series_labels = [
+                        f"alpha_tilde={a_tilde}" for a_tilde in alpha_tildes
+                    ]
                     writer.write_line_series(
                         "hp_tuning_MELR_unweighted/lines",
                         steps_N,
